@@ -1,0 +1,9 @@
+# pnpm 10+ blocks every dependency that ships an install/build script until it is
+# explicitly reviewed here (strictDepBuilds defaults to true: an unlisted script
+# is a hard install error).
+#
+# esbuild is allowed because Vitest requires its native binary, and the script in
+# question downloads/builds that binary. Everything else stays denied by default:
+# add an entry only after reviewing what the script actually does.
+allowBuilds:
+  esbuild: true

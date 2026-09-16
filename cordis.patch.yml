@@ -1,0 +1,49 @@
+# BMPP configuration layer
+#
+# Row configuration. The schema, defaults and semantics live in
+# `src/config.ts` and are documented in `docs/ARCHITECTURE.md` (§13.3).
+#
+# INSTALLED FORM (distribution):
+#   Two independent dimensions describe what the plugin contributes, but only
+#   the values you actually want to differ from the default belong here.
+#
+#     mode:    off | audit | enforce      # is the policy off, watching, or imposing?
+#     profile: compat | strict            # how rigorous is the policy?
+#
+#   `profile` NEVER changes `mode`. `mode: audit` never denies and never asks
+#   for approval, whatever the profile says.
+#
+#   Defaults (approved): mode = audit, profile = compat.
+#   Rollout: audit+compat -> enforce+compat -> (later) enforce+strict.
+- insert:
+    - id: bmpp
+      # The package's own name: after `dsh plugin add`, Node resolves it from
+      # the profile directory, exactly like any other installed bundle.
+      name: 'dsh-bmpp'
+      config:
+        mode: audit
+        profile: compat
+        policyVersion: '0.1.0'
+
+# ---------------------------------------------------------------------------
+# UNINSTALLED / DEVELOPMENT FORM
+#
+# While iterating on the plugin source, install nothing into the profile and
+# boot a throwaway profile with a `--patch` overlay instead. Patch rows are
+# configuration only; they do not change the directory from which the loader
+# resolves module paths, which is why the row below uses an absolute path:
+#
+#   dsh --profile bmpp-dev --patch <bmpp-checkout>/overlay.dev.cordis.yml
+#
+# and `overlay.dev.cordis.yml` contains:
+#
+#   - insert:
+#       - id: bmpp
+#         name: '<bmpp-checkout>/src/index.ts'   # absolute path, TypeScript via tsx
+#         config:
+#           mode: audit
+#           profile: compat
+#           policyVersion: '0.1.0'
+#
+# See docs/DISTRIBUTION.md for the full development and distribution paths.
+# ---------------------------------------------------------------------------

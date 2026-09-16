@@ -1,0 +1,30 @@
+# Build output (never committed: consumers install from the registry, not from git)
+lib/
+
+# Dependencies
+node_modules/
+
+# Other package managers' lockfiles: pnpm is this project's package manager, and
+# two competing lockfiles would resolve two different dependency graphs.
+package-lock.json
+yarn.lock
+
+# Test and coverage output
+coverage/
+*.tsbuildinfo
+
+# Logs and local runtime state
+*.log
+*.local
+.env
+.env.*
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local development overlays: these name this machine's absolute paths and must
+# never reach a public repository. See docs/DISTRIBUTION.md.
+overlay.dev.cordis.yml
+*.local.cordis.yml

@@ -1,0 +1,9 @@
+# Full rigor. Review `docs/ARCHITECTURE.md` §13.3.1 before adopting: `strict`
+# raises the overwrite, secret and test-fixture guards to `deny` and makes
+# destructive memory operations ask for approval. Reverting is one line.
+- insert:
+    - id: bmpp
+      name: 'dsh-bmpp'
+      config:
+        mode: enforce
+        profile: strict

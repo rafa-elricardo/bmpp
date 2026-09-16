@@ -1,0 +1,8 @@
+# Impose the core recall precondition, with secondary guards still warning.
+# `profile: compat` keeps overwrite/secret/test-fixture guards at `warn`.
+- insert:
+    - id: bmpp
+      name: 'dsh-bmpp'
+      config:
+        mode: enforce
+        profile: compat

@@ -1,0 +1,6 @@
+# Disabled without removing the row. `profile` is ignored in this mode.
+- insert:
+    - id: bmpp
+      name: 'dsh-bmpp'
+      config:
+        mode: off

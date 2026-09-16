@@ -1,0 +1,9 @@
+# The approved default: observe and audit, impose nothing.
+# Use this for the first rollout step; read the `bmpp/policy` audit events to
+# see exactly which calls the policy WOULD have blocked.
+- insert:
+    - id: bmpp
+      name: 'dsh-bmpp'
+      config:
+        mode: audit
+        profile: compat
