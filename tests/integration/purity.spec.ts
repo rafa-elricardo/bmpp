@@ -15,9 +15,10 @@
  * Requires `pnpm run build` to have run since the last source change.
  */
 
+import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 
 const PURE_MODULES = ['state', 'reason-codes'] as const
 const BUILD_OUTPUT = new URL('../../lib/', import.meta.url)
@@ -40,11 +41,22 @@ function importsOf(source: string): readonly string[] {
 }
 
 describe('the pure policy modules stay pure', () => {
-  it('has a build to inspect', () => {
-    const built = fileURLToPath(new URL('state.js', BUILD_OUTPUT))
-    if (!existsSync(built)) {
-      throw new Error('run `pnpm run build` before this suite: lib/state.js is missing')
+  beforeAll(() => {
+    // Inspecting emitted JavaScript is the point of this suite, so it builds
+    // what it inspects rather than depending on the caller having done it.
+    if (existsSync(fileURLToPath(new URL('state.js', BUILD_OUTPUT)))) return
+    const result = spawnSync('pnpm', ['run', 'build'], {
+      cwd: fileURLToPath(new URL('../../', import.meta.url)),
+      stdio: 'pipe',
+      encoding: 'utf8',
+    })
+    if (result.status !== 0) {
+      throw new Error(`pnpm run build failed while preparing the purity suite:\n${result.stdout}\n${result.stderr}`)
     }
+  })
+
+  it('has a build to inspect', () => {
+    expect(existsSync(fileURLToPath(new URL('state.js', BUILD_OUTPUT)))).toBe(true)
     expect(existsSync(fileURLToPath(new URL('reason-codes.js', BUILD_OUTPUT)))).toBe(true)
   })
 
@@ -75,6 +87,39 @@ describe('the pure policy modules stay pure', () => {
       expect(builtins).toEqual([])
     })
   }
+})
+
+describe('the integration module imports no Harness VALUE', () => {
+  /**
+   * `gate.ts` is allowed type-only imports from the Harness — they are erased at
+   * compile time — but a VALUE import would risk a second module instance of a
+   * Harness package, so the emitted JavaScript must be free of them.
+   */
+  const HARNESS_VALUE_IMPORTS = /\b(?:import|require)\s*(?:\(\s*)?["'][^"']*@deepseek-ai\//g
+
+  it('emits no value import from @deepseek-ai/*', () => {
+    const source = readFileSync(fileURLToPath(new URL('gate.js', BUILD_OUTPUT)), 'utf8')
+    expect(source.match(HARNESS_VALUE_IMPORTS)).toBeNull()
+    // Sanity: the module really is the integration layer and does import
+    // something, so a silently empty file cannot pass this test.
+    expect(source).toContain('bmpp__classify')
+    expect(importsOf(source).length).toBeGreaterThan(0)
+  })
+
+  it('resolves every one of its imports', () => {
+    const source = readFileSync(fileURLToPath(new URL('gate.js', BUILD_OUTPUT)), 'utf8')
+    for (const specifier of importsOf(source)) {
+      expect(specifier.startsWith('./') || specifier.startsWith('../') || specifier.startsWith('node:'))
+        .toBe(true)
+    }
+  })
+
+  it('keeps the pure modules free of ALL imports from the Harness', () => {
+    for (const moduleName of PURE_MODULES) {
+      const source = readFileSync(fileURLToPath(new URL(`${moduleName}.js`, BUILD_OUTPUT)), 'utf8')
+      expect(source.match(HARNESS_VALUE_IMPORTS)).toBeNull()
+    }
+  })
 })
 
 describe('the policy module surface is closed', () => {

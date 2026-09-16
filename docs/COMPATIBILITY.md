@@ -83,6 +83,20 @@ reaches the operator. Nothing fails silently, and nothing half-activates.
 The decision itself is a pure function (`decideActivation`) kept separate from detection, so both
 are unit-testable without a Harness process.
 
+### A Harness-side limitation the gate lives with
+
+The MCP bridge does not forward a server's `outputSchema` when it cannot map it, and the Basic
+Memory server advertises none for `search_notes`. The only structured signal BMPP receives about a
+recall is therefore `isError`.
+
+Consequently the integration maps a recall to `ok` or `failed`, and an empty-but-successful search
+is recorded as `ok`. That is safe for the policy — any non-error result satisfies the recall
+precondition — but it means the `RECALL_EMPTY` audit observation is unreachable until the bridge or
+the server exposes a structured result. See `docs/ARCHITECTURE.md` §7.4(a).
+
+A behaviour change on the Basic Memory side (for example a real `outputSchema` on `search_notes`)
+would be a re-verification trigger, not a silent improvement.
+
 ## What BMPP deliberately does not depend on
 
 The emitted runtime code imports **nothing** from the Harness. `@deepseek-ai/*` packages are used

@@ -205,10 +205,19 @@ describe('tool service surface probe', () => {
   })
 })
 
-/** Minimal Cordis-shaped context; `apply` only uses `get` and `logger`. */
-function context(tools: unknown, warnings: string[] = []) {
+/**
+ * Minimal Cordis-shaped context.
+ *
+ * `apply` now mounts the gate, so the fake must also answer `on` and
+ * `tools.register`; `get` resolves the `tools` service for the surface probe and
+ * returns nothing for `sessionProjections`, which keeps this suite on the
+ * fallback path.
+ */
+function context(tools: unknown, warnings: string[] = [], projections: object | undefined = undefined) {
   return {
-    get: () => tools,
+    get: (name: string) => (name === 'tools' ? tools : name === 'sessionProjections' ? projections : undefined),
+    on: () => () => undefined,
+    tools: { register: () => () => undefined },
     logger: {
       info: () => undefined,
       warn: (message: string) => warnings.push(message),
@@ -254,8 +263,37 @@ describe('plugin entry point', () => {
 
   it('logs the load and every configuration warning', () => {
     const warnings: string[] = []
-    apply(context(completeTools, warnings), { mode: 'off', profile: 'strict' })
-    expect(warnings.length).toBe(2)
+    const report = apply(context(completeTools, warnings), { mode: 'off', profile: 'strict' })
+    // Two configuration warnings plus the missing-projection notice. The report
+    // is the complete record, so its list must match what was logged.
+    expect(report.warnings).toHaveLength(3)
+    expect(warnings).toHaveLength(3)
+    expect(report.warnings.join('\n')).toContain('ignores profile')
+    expect(report.warnings.join('\n')).toContain('auditLevel has no effect')
+    expect(report.warnings.join('\n')).toContain('sessionProjections is unavailable')
+  })
+
+  it('reports whether the host provides sessionProjections', () => {
+    const withProjections = apply(
+      context(completeTools, [], { stateOf: () => undefined }),
+      { mode: 'audit' },
+    )
+    expect(withProjections.hasSessionProjections).toBe(true)
+    expect(withProjections.gate).toBeDefined()
+
+    const without = apply(context(completeTools), { mode: 'audit' })
+    expect(without.hasSessionProjections).toBe(false)
+  })
+
+  it('mounts no gate in mode off', () => {
+    const report = apply(context(completeTools), { mode: 'off' })
+    expect(report.gate).toBeUndefined()
+  })
+
+  it('mounts the gate in audit and enforce', () => {
+    for (const mode of ['audit', 'enforce'] as const) {
+      expect(apply(context(completeTools), { mode }).gate).toBeDefined()
+    }
   })
 })
 

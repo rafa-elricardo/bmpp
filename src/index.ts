@@ -5,11 +5,13 @@
  * checkable parts of the memory policy into invariants the runtime enforces,
  * while leaving every semantic judgement to the model.
  *
- * STATUS: foundation only. This module loads, validates its configuration,
- * checks its host surface and reports compatibility. It registers NO tool
- * interception, NO state machine and NO audit events yet — those arrive in
- * later phases, each with its own commit. Loading it today is a no-op beyond a
- * log line and the returned load report.
+ * STATUS: the gate is mounted. This module validates its configuration, checks
+ * its host surface, reports compatibility, and mounts the integration layer
+ * (`./gate.ts`) that connects the pure policy machine to `tools/pre-execute`,
+ * `tools/result` and the `bmpp__classify` control tool.
+ *
+ * Audit events (`bmpp/policy`) and the secondary guards are NOT part of this
+ * increment; see `docs/ARCHITECTURE.md` §27 for the phase plan.
  *
  * Design: `docs/ARCHITECTURE.md`. Compatibility: `docs/COMPATIBILITY.md`.
  *
@@ -18,6 +20,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { validateConfig, type BmppConfig } from './config.ts'
+import { createGate, type BmppGate } from './gate.ts'
 import {
   BMPP_VERSION,
   classifyHarnessVersion,
@@ -58,6 +61,15 @@ export interface BmppLoadReport {
   readonly profile: BmppConfig['profile']
   readonly harness: HarnessCompatibility
   readonly warnings: readonly string[]
+  /**
+   * The mounted gate, or `undefined` in `mode: 'off'`.
+   *
+   * Exposed so a test can read tracked state and drive the gate directly,
+   * without reaching into module internals.
+   */
+  readonly gate: BmppGate | undefined
+  /** Whether the host provides the `sessionProjections` service. */
+  readonly hasSessionProjections: boolean
 }
 
 /**
@@ -126,24 +138,43 @@ export function apply(ctx: Context, rawConfig: unknown = {}): BmppLoadReport {
     throw new Error(`BMPP ${BMPP_VERSION} refused to load: ${describeCompatibility(harness)}`)
   }
 
+  const hasSessionProjections = ctx.get('sessionProjections') !== undefined
+
+  // `mode: 'off'` means off: nothing is registered and no decision is taken.
+  const gate = config.mode === 'off' ? undefined : createGate({ ctx, config })
+
+  // Warnings are collected before the report so the report is the complete
+  // record of what this load decided, not a partial one.
+  const warnings = [...validation.warnings]
+  if (!hasSessionProjections) {
+    warnings.push(
+      'sessionProjections is unavailable, so turn numbers come from the gate counter; '
+      + 'turn resets still work but lose the Harness turn number',
+    )
+  }
+
   const report: BmppLoadReport = {
     bmppVersion: BMPP_VERSION,
     policyVersion: config.policyVersion,
     mode: config.mode,
     profile: config.profile,
     harness,
-    warnings: validation.warnings,
+    warnings,
+    gate,
+    hasSessionProjections,
   }
 
   ctx.logger?.info(
-    'bmpp %s loaded (policy %s, mode %s, profile %s); %s; no interception active yet',
+    'bmpp %s loaded (policy %s, mode %s, profile %s); %s; %s; %s',
     report.bmppVersion,
     report.policyVersion,
     report.mode,
     report.profile,
     describeCompatibility(harness),
+    gate === undefined ? 'policy off, nothing registered' : 'gate mounted on tools/pre-execute + tools/result',
+    hasSessionProjections ? 'turn boundary from sessionProjections' : 'turn boundary from the internal counter',
   )
-  for (const warning of report.warnings) ctx.logger?.warn('bmpp: %s', warning)
+  for (const warning of warnings) ctx.logger?.warn('bmpp: %s', warning)
 
   return report
 }

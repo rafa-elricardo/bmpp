@@ -18,6 +18,7 @@ Data: 2026-09-16 · Autor: agente DSH · Status: **revisão 3 aprovada como base
 |---|---|---|---|
 | 1 | 2026-09-16 | Projeto inicial (26 seções) | maintainer (as the architectural baseline) |
 | 2 | 2026-09-16 | Local do plugin fixado em `packages/bmpp/`; modelo de configuração normalizado (`mode` × `profile`); `bmpp__classify` deixa de exigir posição de primeira chamada; escopo do MVP fixado em Basic Memory; `ask` só em `profile: strict`; defaults `mode: audit` + `profile: compat`; estado do Git registrado | maintainer |
+| 4 | 2026-09-16 | **Incremento 1c implementado**: o gate foi montado sobre `tools/pre-execute`, `tools/result`, `session/disposed` e a ferramenta `bmpp__classify`; duas adaptações ao runtime real registradas em §7.4 | maintainer |
 | 3 | 2026-09-16 | **BMPP passa a ser um projeto standalone** em `<workspace>/bmpp/`, com repositório Git próprio e versionamento independente; o checkout do DSH permanece clone oficial, sem fork, sem branch e sem alteração; forma de distribuição confirmada como *bundle* (`dsh.bundle`); estratégia de compatibilidade e de licença definidas; documentação arquitetural migrada para dentro do repositório do BMPP | maintainer |
 
 **Decisões normativas da rev. 2** (o resto do documento já reflete cada uma):
@@ -520,6 +521,35 @@ Uma consulta de memória **conta como satisfeita** quando, no turno corrente:
   transita para `RECALL_OK`.
 - `RECALL_FAILED` é fail-closed apenas para **mutações de memória**; leituras continuam permitidas.
 - "Concluída" nunca significa "bem-sucedida em encontrar algo" — significa "o resultado voltou".
+
+### 7.4 Adaptações exigidas pelo runtime real (incremento 1c)
+
+Duas premissas deste capítulo não têm suporte direto no runtime e foram adaptadas. Ficam
+registradas aqui para que a divergência entre o desenho e o código seja explícita.
+
+**(a) `RECALL_EMPTY` não é alcançável pelo adaptador real.** O servidor Basic Memory não declara
+`outputSchema` para `search_notes` (`outputSchema: null`), então o bridge MCP entrega apenas
+`McpResult = { content, structuredContent? }` — blocos de conteúdo, sem campo estruturado de
+contagem. O único sinal confiável é `isError`. A integração mapeia:
+
+| Resultado | Sub-estado |
+|---|---|
+| `isError === false` | `succeeded` / `ok` → gate **aberto** |
+| `isError === true` | `failed` → gate **fechado** |
+| vazio com sucesso | indistinguível de `ok` → **tratado como `ok`** |
+
+Isto **não altera a política**: §7.2 já determinava que todo resultado sem erro satisfaz o gate,
+inclusive vazio. `RECALL_EMPTY` era observação de auditoria, nunca um gate. O tipo `empty` permanece
+na state machine e nos testes, porém **não-alcançável** a partir do pipeline. Uma inferência de
+vazio exigiria interpretar texto de `ContentBlock`, o que este projeto recusa fazer. A distinção
+volta se — e quando — o servidor passar a expor um sinal estruturado.
+
+**(b) Não existe evento observável de início de sessão.** O sinal que §7.3 atribuía a
+`agent/session-start` é um evento de **agente**, não do store de sessões, e não serve como marco de
+criação da sessão. Adaptação implementada: **inicialização preguiçosa** do estado na primeira
+chamada de ferramenta da sessão, mais reset por **avanço do turno** (`turnBoundary.lastTurn`), o que
+produz o mesmo efeito — todo turno novo nasce `UNKNOWN`. O descarte do estado por sessão usa
+`session/disposed`, que é um sinal real e não escopado.
 
 ### 7.3 Transições e reset
 
