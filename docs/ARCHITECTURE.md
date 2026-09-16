@@ -18,6 +18,7 @@ Data: 2026-09-16 · Autor: agente DSH · Status: **revisão 3 aprovada como base
 |---|---|---|---|
 | 1 | 2026-09-16 | Projeto inicial (26 seções) | maintainer (as the architectural baseline) |
 | 2 | 2026-09-16 | Local do plugin fixado em `packages/bmpp/`; modelo de configuração normalizado (`mode` × `profile`); `bmpp__classify` deixa de exigir posição de primeira chamada; escopo do MVP fixado em Basic Memory; `ask` só em `profile: strict`; defaults `mode: audit` + `profile: compat`; estado do Git registrado | maintainer |
+| 5 | 2026-09-16 | **Incremento 1d implementado**: eventos duráveis `bmpp/policy` com duas formas (`pre-execute` e `recall`), append isolado do veredito, e a separação explícita entre `policyTurn` e `harnessTurn` documentada em §13.1 | maintainer |
 | 4 | 2026-09-16 | **Incremento 1c implementado**: o gate foi montado sobre `tools/pre-execute`, `tools/result`, `session/disposed` e a ferramenta `bmpp__classify`; duas adaptações ao runtime real registradas em §7.4 | maintainer |
 | 3 | 2026-09-16 | **BMPP passa a ser um projeto standalone** em `<workspace>/bmpp/`, com repositório Git próprio e versionamento independente; o checkout do DSH permanece clone oficial, sem fork, sem branch e sem alteração; forma de distribuição confirmada como *bundle* (`dsh.bundle`); estratégia de compatibilidade e de licença definidas; documentação arquitetural migrada para dentro do repositório do BMPP | maintainer |
 
@@ -841,58 +842,93 @@ Regras normativas:
 
 ## 13. Formato dos audit events (Questões 16 e 17)
 
-### 13.1 Evento durável
+### 13.1 Evento durável — formato implementado (incremento 1d)
 
-Module augmentation (padrão real de `goal`, `tool-present`, `hooks`):
+O rascunho original desta seção previa um payload único com `ts`, `step`, `callId` e `action`. A
+implementação real tem **duas formas**, discriminadas por `kind`, porque uma decisão de
+`tools/pre-execute` e um desfecho de recall são fatos distintos, com campos distintos. Ambas vão
+para o **mesmo** evento de sessão, via module augmentation:
 
-```js
-// bmpp: declaração de tipo (equivalente TS) — em JS puro, só o append.
-// declare module '@deepseek-ai/dsh-session/types' {
-//   interface SessionEventMap { 'bmpp/policy': BmppPolicyEvent }
-// }
+```ts
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionEventMap {
+    'bmpp/policy': BmppPolicyPayload
+  }
+}
 
-session.append('bmpp/policy', {
-  ts: 1757... ,                 // epoch ms (o log já carimba time/seq; aqui é redundância útil)
-  turn: 7,                      // turno do Harness
-  step: 2,
-  callId: 'call_abc',           // identidade da chamada
-  tool: 'write_note',           // nome público (mcp__basic-memory__write_note)
-  toolClass: 'memory.write',    // 'memory.read' | 'memory.write' | 'control' | 'other'
-  action: 'pre-execute',        // 'pre-execute' | 'result' | 'turn.reset' | 'session.start'
-  policyState: 'RECALL_REQUIRED', // estado da state machine
-  decision: 'deny',             // 'allow' | 'deny' | 'observe'
-  reasonCode: 'MEMORY_LOOKUP_REQUIRED',
-  recall: { state:'idle', attempts:0 },
-  classification: 'complex',    // 'unknown' | 'simple' | 'complex'
-  mode: 'audit',                // mode efetivo da linha
-  profile: 'compat',            // profile efetivo da linha
-  enforced: false,              // true somente quando mode==='enforce' e a decisão foi aplicada
-  auditOverride: true,          // true quando a decisão registrada foi deny/warn mas a chamada passou
-  policyVersion: '1.0.0',
-  pluginVersion: '0.1.0'
-})
+session.append('bmpp/policy', payload)   // em src/audit.ts, único ponto de escrita
 ```
 
-Notas de privacidade (ver §14):
+O `time` e o `seq` do evento **não** entram no payload: o log já os carimba. O rascunho previa
+duplicá-los; a implementação não os duplica.
 
-- **nunca** conteúdo de nota, argumentos completos, texto do usuário ou chain-of-thought;
-- `callId` é opaco e local;
-- permalink/path só quando estritamente necessário para a checagem de duplicata, e de forma
-  **truncada** por default (`maxPathChars`, §13.3) — configurável para hashing.
+#### 13.1.1 `kind: 'pre-execute'` — uma chamada avaliada
 
-`mode`, `profile`, `enforced` e `auditOverride` em **todo** evento são o que permite responder
-depois "esta decisão foi aplicada ou apenas registrada?" sem depender de lembrar a configuração da
-época.
+| Campo | Significado |
+|---|---|
+| `kind` | `'pre-execute'` |
+| `harnessTurn?` | turno do Harness, **ausente** quando o host não expõe um — nunca sintetizado |
+| `policyTurn` | turnos abertos pelo BMPP, contados **a partir de 1** |
+| `tool` | nome público da ferramenta, truncado em 64 caracteres |
+| `toolClass` | `memory.read` \| `memory.write` \| `control` \| `other` |
+| `policyState` | estado da state machine no momento da decisão |
+| `decision` | veredito de **política**, antes de `mode`: `allow` \| `deny` |
+| `reasonCode` | código machine-readable (§12.3) |
+| `enforcement` | o que o `mode` fez: `allowed` \| `denied` \| `asked` \| `overridden` |
+| `enforced` | `true` somente quando `mode: enforce` aplicou o veredito |
+| `auditOverride` | `true` quando o modo registrou uma negação sem aplicá-la |
+| `classification` | estado que **esta** decisão produziu |
+| `recallState` | sub-estado de recall no momento da decisão |
+| `observation?` | código de observação, presente só quando houve um |
+| `mode` / `profile` | configuração efetiva da linha |
+| `policyVersion` | versão da política, vinda da configuração — fonte única |
+| `pluginVersion` | versão do BMPP que escreveu o evento |
+
+#### 13.1.2 `kind: 'recall'` — uma consulta obrigatória liquidada
+
+| Campo | Significado |
+|---|---|
+| `kind` | `'recall'` |
+| `harnessTurn?` / `policyTurn` | idem acima |
+| `tool` | a ferramenta de busca cujo resultado liquidou o recall |
+| `toolClass` | sempre `memory.read` |
+| `recallState` | sub-estado **depois** de aplicar o desfecho |
+| `recallOutcome` | `ok` \| `failed` — na prática `empty` é inalcançável (§7.4a) |
+| `classification`, `mode`, `profile`, `policyVersion`, `pluginVersion` | idem acima |
+
+#### 13.1.3 Os dois turnos **não** são a mesma coisa
+
+`policyTurn` conta os turnos que **o BMPP abriu** — 1 no primeiro turno observado, 2 no seguinte —
+e `harnessTurn` é o número de turno do **Harness**, presente apenas quando o host o reporta
+(`turnBoundary.lastTurn`). Eles coincidem por acidente em muitos casos e **não** são
+intercambiáveis: um host sem projeção de turno produz eventos com `harnessTurn` ausente e
+`policyTurn` perfeitamente utilizável. Um teste dedicado afirma que os dois divergem quando
+divergem, e que `harnessTurn` **nunca** é derivado de `policyTurn`.
+
+#### 13.1.4 Falha de auditoria não altera veredito
+
+`appendAudit()` captura tudo: ausência de `append`, exceção do `append`, sessão já descartada. O
+gate conta a falha (`auditFailureCount`), emite **um** warning por sessão e segue — a política não
+fica menos confiável porque o log quebrou. Coberto por três testes de integração que afirmam que o
+veredito e a execução da ferramenta permanecem idênticos com o append quebrado.
+
+#### 13.1.5 Privacidade do payload (ver §14)
+
+- **nunca** conteúdo de nota, argumentos da ferramenta, texto do usuário, transcript ou
+  chain-of-thought — o payload só carrega nomes, classes, estados, códigos e contadores;
+- o payload é JSON lossless **por construção**; uma chave com valor `undefined` é rejeitada pelo log
+  (`session.append` valida), então campos ausentes são **omitidos**, não nulos — descoberto na
+  implementação e garantido agora pelo compilador (`exactOptionalPropertyTypes`).
 
 ### 13.2 Perguntas que a auditoria responde mecanicamente
 
 | Pergunta | Como | Ferramenta |
 |---|---|---|
 | "Esta tarefa exigia consulta à memória?" | existe `bmpp/policy` com `classification:'complex'` (ou `'unknown'`) para o turno | `grep`/jq no log da sessão |
-| "A consulta obrigatória foi realizada?" | existe evento `action:'result'`, `toolClass:'memory.read'`, `recall.state` ∈ {`ok`,`empty`} | idem |
-| "Por que esta chamada foi permitida?" | evento com `decision:'allow'` + `reasonCode` (`ALLOW_RECALL_OK`, `ALLOW_READ_ONLY`, `ALLOW_SIMPLE`) | idem |
-| "Por que esta chamada foi bloqueada?" | evento com `decision:'deny'` + `reasonCode` | idem |
-| "O estado foi resetado?" | evento `action:'turn.reset'` no `turn/start` seguinte | idem |
+| "A consulta obrigatória foi realizada?" | evento com `kind:'recall'` e `recallOutcome:'ok'` | idem |
+| "Por que esta chamada foi permitida?" | evento com `decision:'allow'` + `reasonCode`, ou `enforcement:'overridden'` quando o modo a deixou passar | idem |
+| "Por que esta chamada foi bloqueada?" | evento com `decision:'deny'`, `reasonCode` e `enforcement` | idem |
+| "O estado foi resetado?" | `policyTurn`/`harnessTurn` avançam entre eventos do mesmo `sessionId` | idem |
 | "Reproduzível nos testes?" | os mesmos eventos são afirmados pela suíte vitest | §18 |
 
 Isso torna `policy_verify.py` **obsoleto para as regras que o BMPP impõe** (ele passa a ler eventos

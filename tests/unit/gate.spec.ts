@@ -133,7 +133,7 @@ describe('turn resolution and reset', () => {
     const denied = await host.preExecute(EDIT, {})
     expect(denied.kind).toBe('deny')
     expect(denied.reason).toContain('bmpp__classify')
-    expect(gate.stateOf(SESSION_ID)?.turn.turnId).toBe(2)
+    expect(gate.stateOf(SESSION_ID)?.turn.harnessTurn).toBe(2)
   })
 
   it('uses the gate counter when sessionProjections is absent', async () => {
@@ -141,10 +141,10 @@ describe('turn resolution and reset', () => {
     const gate = createGate({ ctx: host.ctx, config: configWith() })
     await host.preExecute(SEARCH, { query: 'x' })
     // No projection, so the turn number is the fallback counter.
-    expect(gate.stateOf(SESSION_ID)?.turn.turnId).toBe(0)
+    expect(gate.stateOf(SESSION_ID)?.turn.harnessTurn).toBe(0)
     // A later call in the same turn keeps the same number.
     await host.preExecute(SEARCH, { query: 'y' })
-    expect(gate.stateOf(SESSION_ID)?.turn.turnId).toBe(0)
+    expect(gate.stateOf(SESSION_ID)?.turn.harnessTurn).toBe(0)
   })
 
   it('stamps the Harness turn number onto the session state', async () => {
@@ -152,7 +152,7 @@ describe('turn resolution and reset', () => {
     const host = fakeHost(projections)
     const gate = createGate({ ctx: host.ctx, config: configWith() })
     await host.preExecute(SEARCH, { query: 'x' })
-    expect(gate.stateOf(SESSION_ID)?.turn.turnId).toBe(9)
+    expect(gate.stateOf(SESSION_ID)?.turn.harnessTurn).toBe(9)
   })
 })
 

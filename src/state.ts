@@ -89,7 +89,13 @@ export interface ToolCallState {
 
 /** State of one turn. Replaced wholesale on `turn/start`. */
 export interface PolicyTurnState {
-  readonly turnId: number
+  /**
+   * The Harness turn this sub-state belongs to, or `undefined` when the host
+   * exposes no turn boundary.
+   */
+  readonly harnessTurn: number | undefined
+  /** Turns opened by this machine, so an event can report it without extra input. */
+  readonly policyTurn: number
   readonly classification: Classification
   readonly recall: RecallStateView
   readonly calls: ToolCallState
@@ -103,6 +109,15 @@ export interface PolicyTurnState {
 export interface PolicySessionState {
   readonly sessionId: string
   readonly policyVersion: string
+  /**
+   * How many turns this machine has opened, counted by BMPP itself.
+   *
+   * Deliberately NOT the Harness turn number: it starts at zero, advances by
+   * one per reset, and is meaningful even when the host exposes no turn
+   * boundary. The integration layer records the Harness turn beside it (see
+   * `PolicyEvent.turn`) and never conflates the two.
+   */
+  readonly turnCount: number
   /** The active turn sub-state. */
   readonly turn: PolicyTurnState
 }
@@ -147,8 +162,19 @@ export interface PolicyEvent {
   readonly recallState: RecallState
   readonly observation: Observation
   readonly policyVersion: string
-  /** Turn sequence within this session, not the Harness turn number. */
-  readonly turnId: number
+  /**
+   * Turns opened by this machine, counted by BMPP. Not the Harness turn.
+   */
+  readonly policyTurn: number
+  /**
+   * The Harness turn number, present only when the host exposed one.
+   *
+   * Never synthesized from {@link policyTurn}: a guestimate would be worse than
+   * an absent field. Optional rather than `| undefined` because a key holding
+   * `undefined` is not lossless JSON, and this event is destined for the
+   * session log.
+   */
+  readonly turn?: number
 }
 
 /**
@@ -192,8 +218,10 @@ export function initialState(sessionId: string, policyVersion: string): PolicySe
   return {
     sessionId,
     policyVersion,
+    turnCount: 0,
     turn: {
-      turnId: 0,
+      harnessTurn: undefined,
+      policyTurn: 0,
       classification: 'unknown',
       recall: { state: 'idle', outcome: undefined, attempts: 0, lastTool: undefined, attempted: false },
       calls: { total: 0, blocked: 0 },
@@ -221,8 +249,15 @@ export function onSessionStart(sessionId: string, policyVersion: string): Policy
 export function onTurnStart(state: PolicySessionState): PolicySessionState {
   return {
     ...state,
+    turnCount: state.turnCount + 1,
     turn: {
-      turnId: state.turn.turnId + 1,
+      // A new turn has no Harness number until the host reports one: carrying
+      // the previous turn's number forward would label a fresh turn with a
+      // stale identity, which is worse than an absent field.
+      harnessTurn: undefined,
+      // Turns are counted from one: an opened turn has a number, and only the
+      // pre-turn state has none.
+      policyTurn: state.turnCount + 1,
       classification: 'unknown',
       recall: { state: 'idle', outcome: undefined, attempts: 0, lastTool: undefined, attempted: false },
       calls: { total: 0, blocked: 0 },
@@ -368,7 +403,10 @@ function buildEvent(
     recallState: turn.recall.state,
     observation,
     policyVersion: context.policyVersion,
-    turnId: turn.turnId,
+    policyTurn: turn.policyTurn,
+    // A key holding `undefined` is NOT lossless JSON, and the session log
+    // rejects it. An absent Harness turn must be an absent key.
+    ...(turn.harnessTurn === undefined ? {} : { turn: turn.harnessTurn }),
   }
 }
 

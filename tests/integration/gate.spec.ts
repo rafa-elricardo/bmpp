@@ -287,7 +287,7 @@ describe('turn reset through the real pipeline', () => {
     h.projection.turn = 2
     const blocked = await h.execute(WRITE, {}, 'call-write-2')
     expect(blocked.isError).toBe(true)
-    expect(h.gate.stateOf(SESSION)?.turn.turnId).toBe(2)
+    expect(h.gate.stateOf(SESSION)?.turn.harnessTurn).toBe(2)
   })
 })
 
@@ -318,7 +318,7 @@ describe('host without the services the gate can live without', () => {
     const h = await harness({ withProjections: false })
     await h.execute(CLASSIFY_TOOL, { task: 'complex' })
     await h.execute(SEARCH, { query: 'x' }, 'call-s1')
-    expect(h.gate.stateOf(SESSION)?.turn.turnId).toBe(0)
+    expect(h.gate.stateOf(SESSION)?.turn.harnessTurn).toBe(0)
     expect((await h.execute(WRITE, {})).isError).toBe(false)
   })
 

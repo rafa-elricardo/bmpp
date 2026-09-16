@@ -20,7 +20,21 @@ import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { beforeAll, describe, expect, it } from 'vitest'
 
+/**
+ * Modules that must stay free of the Harness entirely: the decision core and
+ * its vocabulary. No imports from `@deepseek-ai/*` of any kind, and no Node
+ * builtin either, so the machine cannot reach ambient state.
+ */
 const PURE_MODULES = ['state', 'reason-codes'] as const
+
+/**
+ * Modules allowed relative imports only, plus type-only Harness imports that
+ * vanish at compile time. `audit` declares the `bmpp/policy` session event via
+ * module augmentation, and the emitted file proves the augmentation left no
+ * runtime trace.
+ */
+const TYPE_ONLY_MODULES = ['audit'] as const
+
 const BUILD_OUTPUT = new URL('../../lib/', import.meta.url)
 
 /** Every module specifier a CommonJS or ESM module imports or requires. */
@@ -85,6 +99,25 @@ describe('the pure policy modules stay pure', () => {
       // No clock, no filesystem, no environment: the decision cannot depend on
       // anything but its arguments.
       expect(builtins).toEqual([])
+    })
+  }
+})
+
+describe('modules that may import types still import no Harness VALUE', () => {
+  for (const moduleName of TYPE_ONLY_MODULES) {
+    it(`${moduleName}.js imports nothing from the Harness at runtime`, () => {
+      const source = readFileSync(fileURLToPath(new URL(`${moduleName}.js`, BUILD_OUTPUT)), 'utf8')
+      expect(source.match(/\b(?:import|require)\s*\(?\s*["'][^"']*@deepseek-ai\//g)).toBeNull()
+      for (const specifier of importsOf(source)) {
+        expect(specifier.startsWith('./') || specifier.startsWith('../')).toBe(true)
+      }
+    })
+
+    it(`${moduleName}.js keeps a module augmentation out of the runtime`, () => {
+      // Proves the `declare module` block really was type-only: the emitted
+      // file mentions the Harness package nowhere at all.
+      const source = readFileSync(fileURLToPath(new URL(`${moduleName}.js`, BUILD_OUTPUT)), 'utf8')
+      expect(source).not.toContain('@deepseek-ai')
     })
   }
 })

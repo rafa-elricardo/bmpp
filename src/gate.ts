@@ -27,6 +27,14 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import type { BmppConfig } from './config.ts'
 import {
+  appendAudit,
+  decisionPayload,
+  recallPayload,
+  type AuditContext,
+  type AuditSession,
+  type EnforcementRecord,
+} from './audit.ts'
+import {
   CLASSIFY_TOOL,
   decide,
   decisionContextFrom,
@@ -38,6 +46,7 @@ import {
   type PolicySessionState,
 } from './state.ts'
 import { ReasonCode, reasonMessage } from './reason-codes.ts'
+import { BMPP_VERSION } from './version.ts'
 
 /**
  * Structural view of the `sessionProjections` service.
@@ -91,6 +100,17 @@ interface SessionEntry {
 export interface GateOptions {
   readonly ctx: Context
   readonly config: BmppConfig
+}
+
+/**
+ * Present any session-like value as the append surface the audit needs.
+ *
+ * The cast is deliberate and narrow: the gate depends on `append` and `id` and
+ * on nothing else, so a host whose session type differs still works as long as
+ * it can persist an event.
+ */
+function asAuditSession(session: object): AuditSession {
+  return session as unknown as AuditSession
 }
 
 /** Model-facing description of the classification tool. */
@@ -160,15 +180,47 @@ export class BmppGate {
   private readonly ctx: Context
   private readonly config: BmppConfig
   private readonly sessions = new Map<string, SessionEntry>()
+  private readonly audit: AuditContext
+  private auditFailures = 0
 
   constructor(options: GateOptions) {
     this.ctx = options.ctx
     this.config = options.config
+    this.audit = {
+      mode: options.config.mode,
+      profile: options.config.profile,
+      pluginVersion: BMPP_VERSION,
+    }
   }
 
   /** Number of sessions currently tracked; exposed for leak assertions. */
   get trackedSessions(): number {
     return this.sessions.size
+  }
+
+  /**
+   * How many audit appends failed.
+   *
+   * A non-zero value means decisions happened without a durable record, which
+   * is worth surfacing — but it never changed a verdict, by design.
+   */
+  get auditFailureCount(): number {
+    return this.auditFailures
+  }
+
+  /**
+   * Write one audit event, swallowing every failure.
+   *
+   * The policy must not become less reliable because the log did: a broken
+   * append is counted and reported once per session by the caller, and the
+   * verdict stands.
+   */
+  private emit(session: AuditSession, payload: Parameters<typeof appendAudit>[1]): void {
+    const result = appendAudit(session, payload)
+    if (!result.ok) {
+      this.auditFailures += 1
+      this.ctx.logger?.warn('bmpp: audit event dropped (%s)', result.error)
+    }
   }
 
   /**
@@ -225,14 +277,20 @@ export class BmppGate {
     const step = decide(state, call, this.decisionContext(sessionId))
     this.sessions.set(sessionId, { state: step.state, harnessTurn: resolution.turn })
 
-    if (step.decision === 'allow') return { reasonCode: step.reasonCode, directive: undefined, auditOverride: false }
-
-    const directive = this.directiveFor(exec, step.reasonCode)
-    return {
-      reasonCode: step.reasonCode,
-      directive,
-      auditOverride: directive === undefined,
+    const directive = step.decision === 'deny' ? this.directiveFor(exec, step.reasonCode) : undefined
+    // `mode: 'audit'` produces no directive, so the call proceeds while the
+    // event still records the denial the policy wanted.
+    const auditOverride = step.decision === 'deny' && directive === undefined
+    const record: EnforcementRecord = {
+      enforcement: directive === undefined
+        ? auditOverride ? 'overridden' : 'allowed'
+        : directive.kind === 'ask' ? 'asked' : 'denied',
+      enforced: directive !== undefined,
+      auditOverride,
     }
+    this.emit(asAuditSession(session), decisionPayload(step.event, this.audit, record))
+
+    return { reasonCode: step.reasonCode, directive, auditOverride }
   }
 
   /**
@@ -271,11 +329,14 @@ export class BmppGate {
     if (entry === undefined) return
     if (!this.config.searchTools.includes(exec.name)) return
 
-    const satisfied = result.isError !== true
-    this.sessions.set(sessionId, {
-      ...entry,
-      state: onRecallResult(entry.state, satisfied ? 'ok' : 'failed'),
-    })
+    const outcome = result.isError === true ? 'failed' : 'ok'
+    const state = onRecallResult(entry.state, outcome)
+    this.sessions.set(sessionId, { ...entry, state })
+    // A recall settlement is a distinct audit fact from the pre-execute
+    // decision that opened it, so it is its own event rather than a mutation of
+    // the earlier one.
+    const resolution = resolveTurn(this.projections(), agent.session, entry.harnessTurn)
+    this.emit(asAuditSession(agent.session), recallPayload(state, exec.name, outcome, this.audit, resolution.turn))
   }
 
   /** Release per-session state when the store reports the session gone. */
@@ -346,9 +407,14 @@ export class BmppGate {
   }
 }
 
-/** Return `state` with its turn id set to the Harness turn number. */
+/**
+ * Return `state` with its Harness turn recorded.
+ *
+ * The machine's own turn counter is untouched: `withTurn` only annotates which
+ * host turn the sub-state belongs to.
+ */
 function withTurn(state: PolicySessionState, turn: number): PolicySessionState {
-  return { ...state, turn: { ...state.turn, turnId: turn } }
+  return { ...state, turn: { ...state.turn, harnessTurn: turn } }
 }
 
 /**

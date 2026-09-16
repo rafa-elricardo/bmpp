@@ -29,12 +29,28 @@ by an explicit envelope, never by version equality — see [docs/COMPATIBILITY.m
 - `docs/DISTRIBUTION.md` — the development and distribution mechanisms, the bundle installation
   path, dependency-declaration rationale, repository hygiene and the license analysis.
 - Unit tests for the configuration model and the version classifier.
+- `src/state.ts` — the pure policy state machine and its reason-code vocabulary:
+  `decide()` returns the verdict, the reason and the audit event, with `mode` and
+  `profile` deliberately absent from its inputs.
+- `src/gate.ts` — the integration layer: `tools/pre-execute`, `tools/result`,
+  `session/disposed`, and the `bmpp__classify` control tool, registered on the
+  real Harness runtime.
+- `src/audit.ts` — durable `bmpp/policy` session events in two shapes
+  (`pre-execute` and `recall`), with `policyTurn` and `harnessTurn` kept
+  distinct and the append isolated from the verdict: a failed audit is counted
+  and reported, and never changes what the policy decides.
 
 ### Notes
 
-- **Foundation only.** No tool interception, no state machine, no audit events, and no enforcement.
-  Those land in later phases, each as its own commit; see `docs/ARCHITECTURE.md` §26.
-- **Not yet installed anywhere.** No Cordis profile references BMPP, and the Harness checkout is
-  untouched.
+- **Gate mounted, audit durable, not yet installed anywhere.** The policy is enforced in-process and
+  every decision is written to the session log; no Cordis profile references BMPP yet, and the
+  Harness checkout is untouched.
+- **Recall outcome is `ok` or `failed` only.** The MCP bridge advertises no output schema for the
+  search tool, so an empty-but-successful search is indistinguishable from a populated one and BMPP
+  refuses to parse content text to guess. `RECALL_EMPTY` stays modelled but unreachable; see
+  `docs/ARCHITECTURE.md` §7.4(a).
+- **Secondary guards still pending.** The overwrite-without-read guard is enforced (except under
+  `profile: strict`, where behaviour is unchanged); the secret-pattern and test-fixture guards are
+  not implemented yet.
 
 [Unreleased]: https://github.com/rafa-elricardo/bmpp/commits/main

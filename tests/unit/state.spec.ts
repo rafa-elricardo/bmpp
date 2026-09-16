@@ -94,7 +94,9 @@ describe('initial state and resets', () => {
     const state = machine()
     expect(state.sessionId).toBe(SESSION)
     expect(state.policyVersion).toBe(POLICY)
-    expect(state.turn.turnId).toBe(0)
+    expect(state.turnCount).toBe(0)
+    expect(state.turn.policyTurn).toBe(0)
+    expect(state.turn.harnessTurn).toBeUndefined()
     expect(state.turn.classification).toBe('unknown')
     expect(state.turn.recall).toEqual({
       state: 'idle', outcome: undefined, attempts: 0, lastTool: undefined, attempted: false,
@@ -109,7 +111,12 @@ describe('initial state and resets', () => {
     expect(decide(open, edit(), CONTEXT).decision).toBe('allow')
 
     const nextTurn = onTurnStart(open)
-    expect(nextTurn.turn.turnId).toBe(open.turn.turnId + 1)
+    // The machine's own counter advances; the Harness turn is not synthesized.
+    expect(nextTurn.turnCount).toBe(open.turnCount + 1)
+    // Turns are numbered from one, so the counter after the reset equals the
+    // number of the turn now open.
+    expect(nextTurn.turn.policyTurn).toBe(nextTurn.turnCount)
+    expect(nextTurn.turn.harnessTurn).toBeUndefined()
     expect(nextTurn.turn.classification).toBe('unknown')
     expect(nextTurn.turn.recall.state).toBe('idle')
     expect(nextTurn.turn.recall.attempted).toBe(false)
@@ -124,7 +131,8 @@ describe('initial state and resets', () => {
     const open = complexWithRecall('ok')
     const fresh = onSessionStart('session-2', POLICY)
     expect(fresh.sessionId).toBe('session-2')
-    expect(fresh.turn.turnId).toBe(0)
+    expect(fresh.turnCount).toBe(0)
+    expect(fresh.turn.harnessTurn).toBeUndefined()
     expect(fresh.turn.classification).toBe('unknown')
     expect(fresh.turn.recall.attempted).toBe(false)
     expect(open.turn.recall.state).toBe('succeeded')
@@ -512,8 +520,10 @@ describe('events carry the audit contract and no content', () => {
       classification: 'unknown',
       recallState: 'idle',
       policyVersion: POLICY,
-      turnId: 0,
+      policyTurn: 0,
     })
+    // No Harness turn is claimed when the host reported none.
+    expect('turn' in step.event).toBe(false)
   })
 
   it('carries the policy version from the decision context, not a constant', () => {
@@ -534,11 +544,22 @@ describe('events carry the audit contract and no content', () => {
     expect(Object.keys(step.event)).not.toContain('args')
   })
 
-  it('reports the turn sequence, which advances only on turn/start', () => {
-    const first = decide(machine(), edit(), CONTEXT)
-    expect(first.event.turnId).toBe(0)
+  it('reports the policy turn, counting from one and advancing only on turn/start', () => {
+    const beforeAnyTurn = decide(machine(), edit(), CONTEXT)
+    // Nothing has opened a turn yet, so this is the pre-turn state.
+    expect(beforeAnyTurn.event.policyTurn).toBe(0)
+
+    const first = decide(onTurnStart(machine()), edit(), CONTEXT)
+    expect(first.event.policyTurn).toBe(1)
     const second = decide(onTurnStart(first.state), edit(), CONTEXT)
-    expect(second.event.turnId).toBe(1)
+    expect(second.event.policyTurn).toBe(2)
+  })
+
+  it('never synthesizes a Harness turn from the policy turn', () => {
+    // The pure machine has no host turn to report, so it says so.
+    const step = decide(machine(), edit(), CONTEXT)
+    expect(step.event.turn).toBeUndefined()
+    expect(step.event.policyTurn).toBe(0)
   })
 })
 
