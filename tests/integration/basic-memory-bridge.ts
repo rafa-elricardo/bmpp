@@ -25,6 +25,7 @@ import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { apply, type BmppLoadReport } from '../../src/index.ts'
 import { BASIC_MEMORY_CATALOG, publicName, type CatalogEntry } from './basic-memory-catalog.ts'
+import { auditDomainDouble } from '../support/audit-domain.ts'
 
 /**
  * What one fixture `tools/call` returns.
@@ -84,7 +85,12 @@ export async function mountBridge(options: BridgeOptions = {}): Promise<Bridge> 
   await ctx.plugin(ToolRuntime)
   await ctx.plugin(SessionStore)
 
-  const report = apply(ctx, options.bmpp ?? { mode: 'enforce', profile: 'compat', policyVersion: '0.1.0' })
+  // The audit domain is the plugin's real durable sink; supplying the facility
+  // makes this harness exercise the same storage path production does.
+  const audit = auditDomainDouble()
+  ctx.provide('storageDomain' as never, audit.facility as never)
+
+  const report = await apply(ctx, options.bmpp ?? { mode: 'enforce', profile: 'compat', policyVersion: '0.1.0' })
   const session = ctx.sessions.create(SessionId('bm-contract'))
 
   const agent = { session } as unknown as never
@@ -108,9 +114,9 @@ export async function mountBridge(options: BridgeOptions = {}): Promise<Bridge> 
         agent,
       })
     },
-    policyEvents: () => session.snapshotEvents()
-      .filter(event => event.type === 'bmpp/policy')
-      .map(event => event.data as unknown as Record<string, unknown>),
+    // Read from the audit sidecar, not the session log: BMPP writes no session
+    // event, so the session log is where a regression would show up as absence.
+    policyEvents: () => audit.records.map(record => record.payload as unknown as Record<string, unknown>),
     async dispose() {
       await ctx.fiber.dispose()
     },

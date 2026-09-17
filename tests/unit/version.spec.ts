@@ -311,6 +311,9 @@ function context(tools: unknown, warnings: string[] = [], projections: object | 
   return {
     get: (name: string) => (name === 'tools' ? tools : name === 'sessionProjections' ? projections : undefined),
     on: () => () => undefined,
+    // The plugin registers its audit-store teardown as an effect, so a host
+    // double must expose the same seam the real context does.
+    effect: () => () => undefined,
     tools: { register: () => () => undefined },
     logger: {
       info: () => undefined,

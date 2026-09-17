@@ -43,11 +43,9 @@ function decisionFor(bridge: Bridge, name: string): Record<string, unknown> | un
   return decisions(bridge).find(event => String(event['tool']) === name)
 }
 
-/** Every `bmpp/policy` payload the gate appended. */
+/** Every audit payload the gate recorded in its own sidecar. */
 function auditPayloads(bridge: Bridge): readonly Record<string, unknown>[] {
-  return bridge.session.snapshotEvents()
-    .filter(event => event.type === 'bmpp/policy')
-    .map(event => event.data as unknown as Record<string, unknown>)
+  return bridge.policyEvents()
 }
 
 /** The recall state the gate holds after a call, read from its own audit trail. */

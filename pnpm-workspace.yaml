@@ -7,3 +7,8 @@
 # add an entry only after reviewing what the script actually does.
 allowBuilds:
   esbuild: true
+  # koffi arrives transitively through the DSH storage packages the audit
+  # sidecar is tested against. Its install script builds a native FFI addon that
+  # BMPP never calls — the sidecar only uses the domain form over the JSON
+  # backend — so the script is denied rather than reviewed and allowed.
+  koffi: false

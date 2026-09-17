@@ -9,13 +9,23 @@
 
 import { describe, expect, it } from 'vitest'
 import {
-  appendAudit,
   decisionPayload,
   recallPayload,
   type AuditContext,
-  type AuditSession,
-  type BmppPolicyPayload,
 } from '../../src/audit.ts'
+import {
+  AUDIT_DOMAIN_NAME,
+  AUDIT_DOMAIN_VERSION,
+  auditRecordSchema,
+  type SealedAuditPayload,
+} from '../../src/audit-sink.ts'
+import {
+  DroppedAuditSink,
+  StorageAuditSink,
+  storageDomainOf,
+} from '../../src/audit-store.ts'
+import { Context } from '@deepseek-ai/cordis'
+import { auditDomainDouble, collectingSink } from '../support/audit-domain.ts'
 import { DEFAULT_CONFIG } from '../../src/config.ts'
 import { ReasonCode, reasonMessage } from '../../src/reason-codes.ts'
 import { decide, initialState, onRecallResult, onTurnStart, CLASSIFY_TOOL, type CallInput } from '../../src/state.ts'
@@ -41,18 +51,6 @@ const ASKED = { enforcement: 'asked', enforced: true, auditOverride: false } as 
 const classify = (task: 'simple' | 'complex'): CallInput => ({ tool: CLASSIFY_TOOL, args: { task } })
 const search = (): CallInput => ({ tool: SEARCH, args: { query: 'a secret-looking query' } })
 const edit = (): CallInput => ({ tool: EDIT, args: { content: 'note body that must not be audited' } })
-
-/** A session double that records what the audit tried to write. */
-function recordingSession(): AuditSession & { written: BmppPolicyPayload[] } {
-  const written: BmppPolicyPayload[] = []
-  return {
-    written,
-    id: SESSION,
-    append: (_type, data) => {
-      written.push(data)
-    },
-  }
-}
 
 describe('decision payload', () => {
   it('records an allow with its reason code and version', () => {
@@ -230,62 +228,13 @@ describe('the payload carries no content and no arguments', () => {
     )
     const recall = recallPayload(state, SEARCH, 'empty', CONTEXT, 2)
     for (const payload of [decision, recall]) {
-      const roundTripped = JSON.parse(JSON.stringify(payload)) as BmppPolicyPayload
+      const roundTripped = JSON.parse(JSON.stringify(payload)) as SealedAuditPayload
       expect(roundTripped).toEqual(payload)
       // No `undefined` survived as a key, and no value is a non-JSON type.
       for (const value of Object.values(payload)) {
         expect(['string', 'number', 'boolean', 'undefined']).toContain(typeof value)
       }
     }
-  })
-})
-
-describe('appendAudit never lets the audit break the policy', () => {
-  it('appends exactly one event to the session', () => {
-    const session = recordingSession()
-    const payload = decisionPayload(
-      decide(initialState(SESSION, POLICY), edit(), DECISION_CONTEXT).event, CONTEXT, DENIED,
-    )
-    expect(appendAudit(session, payload)).toEqual({ ok: true })
-    expect(session.written).toEqual([payload])
-  })
-
-  it('reports a missing append surface instead of throwing', () => {
-    const result = appendAudit({ id: SESSION }, decisionPayload(
-      decide(initialState(SESSION, POLICY), edit(), DECISION_CONTEXT).event, CONTEXT, DENIED,
-    ))
-    expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.error).toContain('no append surface')
-  })
-
-  it('reports a throwing append instead of throwing', () => {
-    const session: AuditSession = {
-      id: SESSION,
-      append: () => {
-        throw new Error('session log is read-only')
-      },
-    }
-    const payload = decisionPayload(
-      decide(initialState(SESSION, POLICY), edit(), DECISION_CONTEXT).event, CONTEXT, DENIED,
-    )
-    const result = appendAudit(session, payload)
-    expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.error).toContain('read-only')
-  })
-
-  it('reports a non-Error throw without leaking a stack', () => {
-    const session: AuditSession = {
-      id: SESSION,
-      append: () => {
-        throw 'a bare string rejection'
-      },
-    }
-    const payload = decisionPayload(
-      decide(initialState(SESSION, POLICY), edit(), DECISION_CONTEXT).event, CONTEXT, DENIED,
-    )
-    const result = appendAudit(session, payload)
-    expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.error).toBe('a bare string rejection')
   })
 })
 

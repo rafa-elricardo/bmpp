@@ -12,6 +12,7 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_CONFIG, type BmppConfig } from '../../src/config.ts'
 import { createGate, resolveTurn, type SessionProjectionsLike } from '../../src/gate.ts'
+import { collectingSink } from '../support/audit-domain.ts'
 import { ReasonCode } from '../../src/reason-codes.ts'
 import { CLASSIFY_TOOL } from '../../src/state.ts'
 import type { Context } from '@deepseek-ai/cordis'
@@ -107,7 +108,7 @@ const UNKNOWN_MEMORY = 'mcp__basic-memory__brand_new_tool'
 describe('mount', () => {
   it('registers the three listeners and the control tool', () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     expect(gate.trackedSessions).toBe(0)
     expect(host.registered.map(def => def.name)).toEqual([CLASSIFY_TOOL])
   })
@@ -119,7 +120,7 @@ describe('turn resolution and reset', () => {
     const host = fakeHost(projections)
     // Exactly one gate per host: a second `createGate` would replace the
     // listener and the assertions below would silently test the wrong instance.
-    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }); gate.mount()
 
     // Turn 1: classify complex, search, then the write is allowed.
     expect(await host.preExecute(CLASSIFY_TOOL, { task: 'complex' })).toEqual({ kind: 'allow' })
@@ -138,7 +139,7 @@ describe('turn resolution and reset', () => {
 
   it('uses the gate counter when sessionProjections is absent', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     await host.preExecute(SEARCH, { query: 'x' })
     // No projection, so the turn number is the fallback counter.
     expect(gate.stateOf(SESSION_ID)?.turn.harnessTurn).toBe(0)
@@ -150,7 +151,7 @@ describe('turn resolution and reset', () => {
   it('stamps the Harness turn number onto the session state', async () => {
     const projections = fakeProjections(9)
     const host = fakeHost(projections)
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     await host.preExecute(SEARCH, { query: 'x' })
     expect(gate.stateOf(SESSION_ID)?.turn.harnessTurn).toBe(9)
   })
@@ -159,7 +160,7 @@ describe('turn resolution and reset', () => {
 describe('classification through the gate', () => {
   it('records a declared classification and releases a SIMPLE turn', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     expect(await host.preExecute(CLASSIFY_TOOL, { task: 'simple' })).toEqual({ kind: 'allow' })
     expect(gate.stateOf(SESSION_ID)?.turn.classification).toBe('simple')
     expect(await host.preExecute(EDIT, {})).toEqual({ kind: 'allow' })
@@ -167,7 +168,7 @@ describe('classification through the gate', () => {
 
   it('treats an invalid declaration as no declaration, in enforce mode', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }); gate.mount()
     for (const args of [{}, { task: 'nonsense' }, { task: 7 }, undefined]) {
       expect((await host.preExecute(CLASSIFY_TOOL, args)).kind).toBe('allow')
     }
@@ -180,7 +181,7 @@ describe('classification through the gate', () => {
 
   it('lets the latest declaration win', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     await host.preExecute(CLASSIFY_TOOL, { task: 'complex' })
     await host.preExecute(CLASSIFY_TOOL, { task: 'simple' })
     expect(gate.stateOf(SESSION_ID)?.turn.classification).toBe('simple')
@@ -190,7 +191,7 @@ describe('classification through the gate', () => {
 describe('recall settlement', () => {
   it('satisfies the gate on a successful search', async () => {
     const host = fakeHost()
-    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }).mount()
     await host.preExecute(CLASSIFY_TOOL, { task: 'complex' })
     await host.preExecute(SEARCH, { query: 'x' })
     expect((await host.preExecute(EDIT, {})).kind).toBe('deny') // still in flight
@@ -200,7 +201,7 @@ describe('recall settlement', () => {
 
   it('does not satisfy the gate on a failed search, and a retry recovers', async () => {
     const host = fakeHost()
-    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }).mount()
     await host.preExecute(CLASSIFY_TOOL, { task: 'complex' })
     await host.preExecute(SEARCH, { query: 'x' })
     host.result(SEARCH, true)
@@ -217,7 +218,7 @@ describe('recall settlement', () => {
 
   it('ignores a result for a tool that is not a search tool', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     await host.preExecute(CLASSIFY_TOOL, { task: 'complex' })
     host.result('mcp__basic-memory__read_note', false)
     expect(gate.stateOf(SESSION_ID)?.turn.recall.state).toBe('idle')
@@ -225,14 +226,14 @@ describe('recall settlement', () => {
 
   it('ignores a result for a session the gate never judged', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     host.result(SEARCH, false, OTHER_SESSION)
     expect(gate.stateOf(OTHER_SESSION)).toBeUndefined()
   })
 
   it('never produces the empty outcome, because no structured signal exists', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     await host.preExecute(CLASSIFY_TOOL, { task: 'complex' })
     await host.preExecute(SEARCH, { query: 'x' })
     host.result(SEARCH, false)
@@ -245,7 +246,7 @@ describe('mode controls enforcement, never the verdict', () => {
   it('audit allows everything and never asks, whatever the profile', async () => {
     for (const profile of ['compat', 'strict'] as const) {
       const host = fakeHost()
-      createGate({ ctx: host.ctx, config: configWith({ mode: 'audit', profile }) })
+      createGate({ ctx: host.ctx, config: configWith({ mode: 'audit', profile }), auditSink: collectingSink() }).mount()
       expect((await host.preExecute(EDIT, {})).kind).toBe('allow')
       expect((await host.preExecute(DELETE, {})).kind).toBe('allow')
       expect((await host.preExecute(UNKNOWN_MEMORY, {})).kind).toBe('allow')
@@ -254,7 +255,7 @@ describe('mode controls enforcement, never the verdict', () => {
 
   it('enforce denies an unclassified memory write', async () => {
     const host = fakeHost()
-    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }).mount()
     const denied = await host.preExecute(EDIT, {})
     expect(denied.kind).toBe('deny')
     expect(denied.reason).toContain('bmpp__classify')
@@ -262,7 +263,7 @@ describe('mode controls enforcement, never the verdict', () => {
 
   it('enforce + strict turns a destructive denial into an approval request', async () => {
     const host = fakeHost()
-    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce', profile: 'strict' }) })
+    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce', profile: 'strict' }), auditSink: collectingSink() }).mount()
     const asked = await host.preExecute(DELETE, {})
     expect(asked.kind).toBe('ask')
     expect(asked.reason).toContain('bmpp__classify')
@@ -270,27 +271,27 @@ describe('mode controls enforcement, never the verdict', () => {
 
   it('enforce + compat denies a destructive call without asking', async () => {
     const host = fakeHost()
-    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce', profile: 'compat' }) })
+    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce', profile: 'compat' }), auditSink: collectingSink() }).mount()
     const denied = await host.preExecute(DELETE, {})
     expect(denied.kind).toBe('deny')
   })
 
   it('audit + strict still never asks', async () => {
     const host = fakeHost()
-    createGate({ ctx: host.ctx, config: configWith({ mode: 'audit', profile: 'strict' }) })
+    createGate({ ctx: host.ctx, config: configWith({ mode: 'audit', profile: 'strict' }), auditSink: collectingSink() }).mount()
     expect((await host.preExecute(DELETE, {})).kind).toBe('allow')
   })
 
   it('leaves read-only tools alone in enforce mode', async () => {
     const host = fakeHost()
-    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }).mount()
     expect((await host.preExecute('mcp__basic-memory__read_note', {})).kind).toBe('allow')
     expect((await host.preExecute(SEARCH, { query: 'x' })).kind).toBe('allow')
   })
 
   it('leaves tools outside the memory namespace alone in enforce mode', async () => {
     const host = fakeHost()
-    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }).mount()
     for (const tool of ['bash', 'edit', 'write', 'terminal', 'present']) {
       expect((await host.preExecute(tool, {})).kind).toBe('allow')
     }
@@ -298,7 +299,7 @@ describe('mode controls enforcement, never the verdict', () => {
 
   it('fails closed on an unknown memory tool in enforce mode', async () => {
     const host = fakeHost()
-    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }).mount()
     const denied = await host.preExecute(UNKNOWN_MEMORY, {})
     expect(denied.kind).toBe('deny')
     expect(denied.reason).toContain('bmpp__classify')
@@ -308,7 +309,7 @@ describe('mode controls enforcement, never the verdict', () => {
 describe('audit override is observable', () => {
   it('reports the policy verdict while the call is allowed', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'audit' }) })
+    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'audit' }), auditSink: collectingSink() }); gate.mount()
     const outcome = gate.evaluate({
       name: EDIT, arguments: {}, agent: { session: { id: SESSION_ID } },
     } as never)
@@ -319,7 +320,7 @@ describe('audit override is observable', () => {
 
   it('reports no override when enforce applies the denial', () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }); gate.mount()
     const outcome = gate.evaluate({
       name: EDIT, arguments: {}, agent: { session: { id: SESSION_ID } },
     } as never)
@@ -329,7 +330,7 @@ describe('audit override is observable', () => {
 
   it('reports no override for an allowed call', () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'audit' }) })
+    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'audit' }), auditSink: collectingSink() }); gate.mount()
     const outcome = gate.evaluate({
       name: 'bash', arguments: {}, agent: { session: { id: SESSION_ID } },
     } as never)
@@ -341,7 +342,7 @@ describe('audit override is observable', () => {
 describe('calls outside the policy scope', () => {
   it('delegates when there is no agent', () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }); gate.mount()
     const outcome = gate.evaluate({ name: EDIT, arguments: {}, agent: undefined } as never)
     expect(outcome).toBeUndefined()
     expect(gate.trackedSessions).toBe(0)
@@ -349,7 +350,7 @@ describe('calls outside the policy scope', () => {
 
   it('keeps per-session state separate', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }); gate.mount()
     await host.preExecute(CLASSIFY_TOOL, { task: 'simple' }, SESSION_ID)
     // The other session never declared anything, so it is still blocked.
     const denied = await host.preExecute(EDIT, {}, OTHER_SESSION)
@@ -362,7 +363,7 @@ describe('calls outside the policy scope', () => {
 describe('session cleanup', () => {
   it('releases state when the store reports the session disposed', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     await host.preExecute(EDIT, {})
     expect(gate.trackedSessions).toBe(1)
     host.dispose(SESSION_ID)
@@ -372,7 +373,7 @@ describe('session cleanup', () => {
 
   it('is idempotent for an unknown session', () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     expect(() => host.dispose('never-seen')).not.toThrow()
     expect(gate.trackedSessions).toBe(0)
   })
@@ -381,7 +382,7 @@ describe('session cleanup', () => {
 describe('classifyTool definition', () => {
   it('declares the contract the registry validates', () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     const tool = gate.classifyTool()
     expect(tool.name).toBe(CLASSIFY_TOOL)
     expect(typeof tool.description).toBe('string')
@@ -393,7 +394,7 @@ describe('classifyTool definition', () => {
 
   it('renders a truthful message for a recorded and an unusable declaration', () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     const render = gate.classifyTool().output.render
     const recorded = render({}, { recorded: true })
     const unusable = render({}, { recorded: false })
@@ -407,7 +408,7 @@ describe('classifyTool definition', () => {
 
   it('reports the recorded declaration without evaluating a second time', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     const tool = gate.classifyTool()
     const exec = {
       callId: 'call-1', rootCallId: 'call-1', name: CLASSIFY_TOOL, arguments: { task: 'complex' },
@@ -427,7 +428,7 @@ describe('classifyTool definition', () => {
 
   it('reports not-recorded when no declaration was applied', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     const exec = {
       callId: 'call-1', rootCallId: 'call-1', name: CLASSIFY_TOOL, arguments: {},
       agent: { session: { id: SESSION_ID } }, signal: new AbortController().signal,
@@ -445,7 +446,7 @@ describe('classifyTool definition', () => {
 describe('evaluate tolerates hostile executions', () => {
   it('never throws for malformed names or arguments', async () => {
     const host = fakeHost()
-    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }) })
+    const gate = createGate({ ctx: host.ctx, config: configWith({ mode: 'enforce' }), auditSink: collectingSink() }); gate.mount()
     const hostile: unknown[] = [undefined, null, 'x', 42, [], { query: 7 }]
     for (const args of hostile) {
       expect(() => gate.evaluate({ name: EDIT, arguments: args, agent: { session: { id: SESSION_ID } } } as never)).not.toThrow()
@@ -463,7 +464,7 @@ describe('evaluate tolerates hostile executions', () => {
   it('spies never fire: the gate performs no logging of its own', () => {
     const host = fakeHost()
     const warn = vi.fn()
-    const gate = createGate({ ctx: host.ctx, config: configWith() })
+    const gate = createGate({ ctx: host.ctx, config: configWith(), auditSink: collectingSink() }); gate.mount()
     void gate
     expect(warn).not.toHaveBeenCalled()
   })

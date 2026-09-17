@@ -1,14 +1,18 @@
 /**
- * Integration proof that the audit reaches the REAL session log.
+ * Integration proof that the audit reaches the DURABLE SIDECAR, and no longer
+ * the session log.
  *
- * These tests mount the genuine `SessionStore` from the installed DSH release,
- * create a real session, drive a real tool call through a real `ToolRuntime`,
- * and then read the durable event log back. That is the whole point: the audit
- * claim is about the session log, so it is asserted against the session log
- * rather than against a double.
+ * These tests mount the genuine `SessionStore` and `ToolRuntime` from the
+ * installed DSH release, create a real session, drive real tool calls, and then
+ * read the audit records back out of the storage domain. Two claims are load
+ * bearing and both are asserted here:
  *
- * The complementary failures — a missing append surface, a throwing append —
- * are asserted to change no verdict at all.
+ * 1. the audit lands, complete and in order, in the plugin's own domain; and
+ * 2. the session log stays free of any `bmpp/policy` event, which is what keeps
+ *    the session observable and resumable.
+ *
+ * The complementary failures — storage unavailable, a medium that rejects the
+ * write — are asserted to change no verdict at all.
  */
 
 import { Context } from '@deepseek-ai/cordis'
@@ -18,11 +22,13 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { describe, expect, it } from 'vitest'
-import type { BmppDecisionPayload, BmppPolicyPayload, BmppRecallPayload } from '../../src/audit.ts'
+import type { SealedDecisionPayload, SealedRecallPayload } from '../../src/audit-sink.ts'
 import { DEFAULT_CONFIG, type BmppConfig } from '../../src/config.ts'
-import { createGate, type SessionProjectionsLike } from '../../src/gate.ts'
+import { type SessionProjectionsLike } from '../../src/gate.ts'
+import { apply } from '../../src/index.ts'
 import { ReasonCode } from '../../src/reason-codes.ts'
 import { CLASSIFY_TOOL } from '../../src/state.ts'
+import { auditDomainDouble, EXPECTED_DOMAIN } from '../support/audit-domain.ts'
 
 const SESSION = 'audit-integration'
 const SEARCH = 'mcp__basic-memory__search_notes'
@@ -63,7 +69,11 @@ function tool(name: string, options: { throws?: boolean } = {}) {
 }
 
 /** Everything one audited scenario needs. */
-async function harness(options: { config?: Partial<BmppConfig>; session?: 'real' | 'none' } = {}) {
+async function harness(options: {
+  config?: Partial<BmppConfig>
+  withStorage?: boolean
+  session?: 'real' | 'none'
+} = {}) {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
@@ -72,13 +82,22 @@ async function harness(options: { config?: Partial<BmppConfig>; session?: 'real'
   const projection = projections()
   ctx.provide('sessionProjections', projection)
 
+  // The audit domain is the only durable sink; a harness without it exercises
+  // the storage-unavailable path.
+  const audit = options.withStorage === false ? undefined : auditDomainDouble()
+  if (audit !== undefined) ctx.provide('storageDomain' as never, audit.facility as never)
+
   const session = options.session === 'none' ? undefined : ctx.sessions.create(SessionId(SESSION))
   const agent = session === undefined
     ? ({ session: { id: SESSION } } as unknown as { session: { id: string } })
     : ({ session } as unknown as { session: { id: string } })
 
   const config: BmppConfig = { ...DEFAULT_CONFIG, mode: 'enforce', ...options.config }
-  const gate = createGate({ ctx, config })
+  // The REAL plugin entry point, so the harness exercises the same resolution,
+  // sink attachment and mounting order that production does.
+  const report = await apply(ctx, config)
+  const gate = report.gate
+  if (gate === undefined) throw new Error('the gate must mount in enforce mode')
 
   const tools = new Map<string, ReturnType<typeof tool>>()
   for (const name of [SEARCH, WRITE, DELETE, READ, BASH]) {
@@ -93,57 +112,78 @@ async function harness(options: { config?: Partial<BmppConfig>; session?: 'real'
       agent: agent as unknown as never,
     })
 
-  /** Every bmpp/policy event in the session log, in order. */
-  const audited = (): BmppPolicyPayload[] => {
-    if (session === undefined) return []
-    return session.snapshotEvents()
-      .filter(event => event.type === 'bmpp/policy')
-      .map(event => event.data as BmppPolicyPayload)
+  /**
+   * Every audit payload in the sidecar, oldest first.
+   *
+   * Flushes first: the sink is write-behind, so without this the assertion would
+   * race the medium rather than test it.
+   */
+  const audited = async (): Promise<(SealedDecisionPayload | SealedRecallPayload)[]> => {
+    // Wait for the storage handoff to settle before reading: the sink starts as
+    // a buffer and takes over once the optional service activates.
+    await gate.settleAudit()
+    await gate.flushAudit()
+    return (audit?.records ?? []).map(record => record.payload)
   }
 
-  return { ctx, gate, session, tools, execute, audited, projection }
+  /** Event types actually persisted in the session log. */
+  const sessionEventTypes = (): string[] =>
+    session === undefined ? [] : session.snapshotEvents().map(event => event.type)
+
+  return { ctx, gate, report, session, tools, execute, audited, sessionEventTypes, audit, projection }
 }
 
-describe('the audit lands in the real session log', () => {
-  it('appends one decision event for one evaluated call', async () => {
+describe('the audit lands in the plugin-owned sidecar', () => {
+  it('records one decision for one evaluated call', async () => {
     const h = await harness()
     await h.execute(WRITE, { title: 'x' })
-    const events = h.audited()
+    const events = await h.audited()
     expect(events).toHaveLength(1)
-    const event = events[0] as BmppDecisionPayload
+    const event = events[0] as SealedDecisionPayload
     expect(event.kind).toBe('pre-execute')
     expect(event.tool).toBe(WRITE)
     expect(event.decision).toBe('deny')
     expect(event.reasonCode).toBe(ReasonCode.CLASSIFICATION_REQUIRED)
     expect(event.enforcement).toBe('denied')
     expect(event.enforced).toBe(true)
+    // The session log is untouched: this is the whole point of the sidecar.
+    expect(h.sessionEventTypes()).not.toContain('bmpp/policy')
+  })
+
+  it('stamps every record with its session id and a monotonic sequence', async () => {
+    const h = await harness()
+    await h.execute(WRITE, {})
+    await h.execute(READ, { identifier: 'n' }, 'call-read')
+    expect(h.audit?.records.map(record => record.sessionId)).toEqual([SESSION, SESSION])
+    expect(h.audit?.records.map(record => record.seq)).toEqual([1, 2])
+    expect(h.audit?.records.every(record => record.recordedAt > 0)).toBe(true)
   })
 
   it('records the real Harness turn number beside the policy turn', async () => {
     const h = await harness()
     h.projection.turn = 5
     await h.execute(WRITE, {})
-    const event = h.audited()[0] as BmppDecisionPayload
+    const event = (await h.audited())[0] as SealedDecisionPayload
     expect(event.harnessTurn).toBe(5)
     // A different quantity from the Harness turn, counted by BMPP from one.
     expect(event.policyTurn).toBe(1)
   })
 
-  it('appends a distinct recall event when a search result settles', async () => {
+  it('records a distinct recall settlement when a search result lands', async () => {
     const h = await harness()
     await h.execute(CLASSIFY_TOOL, { task: 'complex' })
     await h.execute(SEARCH, { query: 'example query' }, 'call-search')
 
-    const events = h.audited()
-    const recall = events.find((event): event is BmppRecallPayload => event.kind === 'recall')
+    const events = await h.audited()
+    const recall = events.find((event): event is SealedRecallPayload => event.kind === 'recall')
     expect(recall).toBeDefined()
     expect(recall?.tool).toBe(SEARCH)
     expect(recall?.recallState).toBe('succeeded')
     expect(recall?.recallOutcome).toBe('ok')
     expect(recall?.classification).toBe('complex')
 
-    // The classification call and the search each produced a decision event too.
-    const decisions = events.filter((event): event is BmppDecisionPayload => event.kind === 'pre-execute')
+    // The classification call and the search each produced a decision too.
+    const decisions = events.filter((event): event is SealedDecisionPayload => event.kind === 'pre-execute')
     expect(decisions.map(event => event.tool)).toEqual([CLASSIFY_TOOL, SEARCH])
   })
 
@@ -153,8 +193,12 @@ describe('the audit lands in the real session log', () => {
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(SessionStore)
     ctx.provide('sessionProjections', projections())
+    const audit = auditDomainDouble()
+    ctx.provide('storageDomain' as never, audit.facility as never)
     const session = ctx.sessions.create(SessionId('audit-failure'))
-    const gate = createGate({ ctx, config: { ...DEFAULT_CONFIG, mode: 'enforce' } })
+    const report = await apply(ctx, { ...DEFAULT_CONFIG, mode: 'enforce' })
+    const gate = report.gate
+    if (gate === undefined) throw new Error('the gate must mount')
     ctx.tools.register(tool(SEARCH, { throws: true }).definition)
     const agent = { session } as unknown as { session: { id: string } }
     const run = (name: string, args: Record<string, unknown> = {}) =>
@@ -164,10 +208,11 @@ describe('the audit lands in the real session log', () => {
     const searched = await run(SEARCH, { query: 'x' })
     expect(searched.isError).toBe(true)
 
-    const recall = session.snapshotEvents()
-      .filter(event => event.type === 'bmpp/policy')
-      .map(event => event.data as BmppPolicyPayload)
-      .find((event): event is BmppRecallPayload => event.kind === 'recall')
+    await gate.flushAudit()
+    const recall = audit.records
+      .map(record => record.payload)
+      .find((event): event is SealedRecallPayload => event.kind === 'recall')
+    expect(audit.records.length).toBeGreaterThan(0)
     expect(recall?.recallOutcome).toBe('failed')
     expect(recall?.recallState).toBe('failed')
 
@@ -183,8 +228,12 @@ describe('the audit lands in the real session log', () => {
     await ctx.plugin(SessionStore)
     ctx.provide('sessionProjections', projections())
     ctx.provide('approval', { request: async () => 'allowed-once' })
+    const audit = auditDomainDouble()
+    ctx.provide('storageDomain' as never, audit.facility as never)
     const session = ctx.sessions.create(SessionId('audit-ask'))
-    createGate({ ctx, config: { ...DEFAULT_CONFIG, mode: 'enforce', profile: 'strict' } })
+    const report = await apply(ctx, { ...DEFAULT_CONFIG, mode: 'enforce', profile: 'strict' })
+    const gate = report.gate
+    if (gate === undefined) throw new Error('the gate must mount')
     const probe = tool(DELETE)
     ctx.tools.register(probe.definition)
     const agent = { session } as unknown as { session: { id: string } }
@@ -195,9 +244,8 @@ describe('the audit lands in the real session log', () => {
     expect(result.isError).toBe(false)
     expect(probe.calls).toEqual([DELETE])
 
-    const event = session.snapshotEvents()
-      .filter(entry => entry.type === 'bmpp/policy')
-      .map(entry => entry.data as BmppPolicyPayload)[0] as BmppDecisionPayload
+    await gate.flushAudit()
+    const event = audit.records[0]?.payload as SealedDecisionPayload
     expect(event.enforcement).toBe('asked')
     expect(event.profile).toBe('strict')
     expect(event.enforced).toBe(true)
@@ -209,7 +257,7 @@ describe('the audit lands in the real session log', () => {
     expect(result.isError).toBe(false)
     expect(h.tools.get(WRITE)?.calls).toEqual([WRITE])
 
-    const event = h.audited()[0] as BmppDecisionPayload
+    const event = (await h.audited())[0] as SealedDecisionPayload
     expect(event.decision).toBe('deny')
     expect(event.enforcement).toBe('overridden')
     expect(event.enforced).toBe(false)
@@ -220,7 +268,7 @@ describe('the audit lands in the real session log', () => {
   it('records the policy version from configuration', async () => {
     const h = await harness({ config: { policyVersion: '9.9.9' } })
     await h.execute(WRITE, {})
-    const event = h.audited()[0] as BmppDecisionPayload
+    const event = (await h.audited())[0] as SealedDecisionPayload
     expect(event.policyVersion).toBe('9.9.9')
   })
 
@@ -232,28 +280,29 @@ describe('the audit lands in the real session log', () => {
     await h.execute(BASH, { command: 'ls' })
     await h.execute(WRITE, { title: 'x' })
 
-    const decisions = h.audited().filter((event): event is BmppDecisionPayload => event.kind === 'pre-execute')
+    const events = await h.audited()
+    const decisions = events.filter((event): event is SealedDecisionPayload => event.kind === 'pre-execute')
     expect(decisions).toHaveLength(5)
     expect(decisions.map(event => event.tool))
       .toEqual([CLASSIFY_TOOL, CLASSIFY_TOOL, READ, BASH, WRITE])
-    // Each event records the state its own decision produced: the first
+    // Each record carries the state its own decision produced: the first
     // declaration already reads `complex`, the reclassification `simple`, and
     // every later call inherits `simple`.
     expect(decisions.map(event => event.classification))
       .toEqual(['complex', 'simple', 'simple', 'simple', 'simple'])
-    // Exactly one event per call: no path emits twice.
-    expect(new Set(decisions.map(event => event.reasonCode)).size).toBeGreaterThan(0)
-    expect(h.audited()).toHaveLength(5)
+    // Exactly one record per call: no path emits twice.
+    expect(events).toHaveLength(5)
   })
 
-  it('records a reclassification as its own event', async () => {
+  it('records a reclassification as its own record', async () => {
     const h = await harness()
     await h.execute(CLASSIFY_TOOL, { task: 'complex' })
     await h.execute(CLASSIFY_TOOL, { task: 'simple' }, 'call-2')
-    const decisions = h.audited().filter((event): event is BmppDecisionPayload => event.kind === 'pre-execute')
+    const decisions = (await h.audited())
+      .filter((event): event is SealedDecisionPayload => event.kind === 'pre-execute')
     expect(decisions[1]?.observation).toBe('RECLASSIFIED')
-    // Every decision event records the state that decision PRODUCED, so the
-    // first declaration already reads `complex` and the second `simple`.
+    // Every record captures the state that decision PRODUCED, so the first
+    // declaration already reads `complex` and the second `simple`.
     expect(decisions[0]?.classification).toBe('complex')
     expect(decisions[0]?.observation).toBeUndefined()
     expect(decisions[1]?.classification).toBe('simple')
@@ -264,83 +313,75 @@ describe('the audit lands in the real session log', () => {
     const result = await h.execute(WRITE, {})
     expect(result.isError).toBe(true)
     expect(h.tools.get(WRITE)?.calls).toEqual([])
-    const event = h.audited()[0] as BmppDecisionPayload
+    const event = (await h.audited())[0] as SealedDecisionPayload
     expect(event.reasonCode).toBe(ReasonCode.CLASSIFICATION_REQUIRED)
   })
 })
 
 describe('a broken audit changes no verdict', () => {
-  it('keeps enforcing when the session has no append surface', async () => {
-    const h = await harness({ session: 'none' })
+  it('keeps enforcing when the host provides no storage service', async () => {
+    const h = await harness({ withStorage: false })
+    // The composition has no storage rows, so the wait ends here rather than at
+    // teardown; the buffered record is reported and the verdict stands.
+    h.gate.abandonAudit()
     const result = await h.execute(WRITE, {})
     expect(result.isError).toBe(true)
     expect(h.tools.get(WRITE)?.calls).toEqual([])
-    // The append was attempted, reported, and swallowed.
+    await h.gate.settleAudit()
     expect(h.gate.auditFailureCount).toBe(1)
   })
 
-  it('keeps enforcing when the append itself throws', async () => {
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime)
-    ctx.provide('sessionProjections', projections())
-    const hostileSession = {
-      id: 'hostile',
-      append: () => {
-        throw new Error('log is read-only')
-      },
-    }
-    const gate = createGate({ ctx, config: { ...DEFAULT_CONFIG, mode: 'enforce' } })
-    const probe = tool(WRITE)
-    ctx.tools.register(probe.definition)
-    const agent = { session: hostileSession } as unknown as { session: { id: string } }
-
-    const result = await ctx.tools.execute({
-      signal, callId: ToolCallId('c1'), name: WRITE, arguments: {}, agent: agent as unknown as never,
-    })
-    // The verdict is unchanged by the failed audit.
+  it('counts a medium that rejects the write, and keeps deciding', async () => {
+    const h = await harness()
+    if (h.audit === undefined) throw new Error('this scenario needs storage')
+    h.audit.failWrites = true
+    const before = h.gate.auditFailureCount
+    const result = await h.execute(WRITE, {})
+    // The verdict is unaffected by the failing medium.
     expect(result.isError).toBe(true)
-    expect(probe.calls).toEqual([])
-    expect(gate.auditFailureCount).toBe(1)
+    expect(h.tools.get(WRITE)?.calls).toEqual([])
+    await h.gate.settleAudit()
+    await h.gate.flushAudit()
+    expect(h.gate.auditFailureCount).toBe(before + 1)
   })
 
-  it('counts a failure per attempt and keeps deciding', async () => {
-    const h = await harness({ session: 'none' })
+  it('counts a drop per attempt and keeps deciding', async () => {
+    const h = await harness({ withStorage: false })
+    h.gate.abandonAudit()
+    await h.gate.settleAudit()
     await h.execute(WRITE, {}, 'c1')
     await h.execute(WRITE, {}, 'c2')
     expect(h.gate.auditFailureCount).toBe(2)
     expect(h.tools.get(WRITE)?.calls).toEqual([])
   })
 
-  it('reports zero failures on a healthy session', async () => {
+  it('reports zero failures with a healthy store', async () => {
     const h = await harness()
     await h.execute(WRITE, {})
+    await h.gate.settleAudit()
+    await h.gate.flushAudit()
     expect(h.gate.auditFailureCount).toBe(0)
   })
 })
 
-describe('the durable event survives the session log contract', () => {
-  it('writes a payload the log accepts as lossless JSON', async () => {
+describe('the durable record survives the storage contract', () => {
+  it('writes a payload that round-trips through JSON exactly', async () => {
     const h = await harness()
     await h.execute(CLASSIFY_TOOL, { task: 'complex' })
     await h.execute(SEARCH, { query: 'x' }, 'call-search')
-    // Reaching this point means `session.append` validated and accepted both
-    // event shapes; a non-lossless payload would have thrown at the append site.
-    const events = h.audited()
+    const events = await h.audited()
     expect(events.length).toBeGreaterThanOrEqual(3)
     for (const event of events) {
       expect(JSON.parse(JSON.stringify(event))).toEqual(event)
     }
   })
 
-  it('assigns each event a sequence number inside the session log', async () => {
+  it('declares the audit domain version explicitly', async () => {
     const h = await harness()
     await h.execute(WRITE, {})
-    const seqs = h.session?.snapshotEvents()
-      .filter(event => event.type === 'bmpp/policy')
-      .map(event => event.seq) ?? []
-    expect(seqs).toHaveLength(1)
-    expect(typeof seqs[0]).toBe('number')
+    const spec = h.audit?.openedSpecs[0] as { name?: unknown; version?: unknown } | undefined
+    expect(spec?.name).toBe(EXPECTED_DOMAIN.name)
+    expect(spec?.version).toBe(EXPECTED_DOMAIN.version)
   })
 
   it('never records the tool arguments', async () => {
@@ -349,7 +390,7 @@ describe('the durable event survives the session log contract', () => {
     await h.execute(CLASSIFY_TOOL, { task: 'complex' })
     await h.execute(SEARCH, { query: 'example query' }, 'call-search')
     await h.execute(WRITE, { content: body, title: 'T' }, 'call-write')
-    const serialized = JSON.stringify(h.audited())
+    const serialized = JSON.stringify(await h.audited())
     expect(serialized).not.toContain(body)
     expect(serialized).not.toContain('example query')
   })

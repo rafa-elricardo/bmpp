@@ -98,7 +98,11 @@ async function harness(options: {
   if (options.approval !== undefined) ctx.provide('approval', { request: options.approval })
 
   const config: BmppConfig = { ...DEFAULT_CONFIG, mode: 'enforce', ...options.config }
-  const gate = createGate({ ctx, config })
+  // The REAL entry point: it resolves the audit store and mounts the listeners.
+  // The gate is read off the report, which is the only supported way to reach it.
+  const report = await apply(ctx, config)
+  const gate = report.gate
+  if (gate === undefined) throw new Error('the gate must mount in enforce mode')
 
   const probes = new Map<string, Probe>()
   for (const name of [SEARCH, WRITE, DELETE, READ, 'bash']) {
@@ -249,7 +253,9 @@ describe('recall settlement through the real result pipeline', () => {
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     ctx.provide('sessionProjections', projections())
-    const gate = createGate({ ctx, config: { ...DEFAULT_CONFIG, mode: 'enforce' } })
+    const report = await apply(ctx, { ...DEFAULT_CONFIG, mode: 'enforce' })
+    const gate = report.gate
+    if (gate === undefined) throw new Error('the gate must mount')
     ctx.tools.register({
       name: SEARCH,
       description: 'failing search',
@@ -337,7 +343,7 @@ describe('the plugin entry point mounts the gate', () => {
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     ctx.provide('sessionProjections', projections())
-    const report = apply(ctx, { mode: 'enforce', profile: 'compat' })
+    const report = await apply(ctx, { mode: 'enforce', profile: 'compat' })
     expect(report.gate).toBeDefined()
     expect(report.hasSessionProjections).toBe(true)
 
@@ -355,7 +361,7 @@ describe('the plugin entry point mounts the gate', () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
-    const report = apply(ctx, { mode: 'off' })
+    const report = await apply(ctx, { mode: 'off' })
     expect(report.gate).toBeUndefined()
     expect(ctx.tools.get(CLASSIFY_TOOL)).toBeUndefined()
 

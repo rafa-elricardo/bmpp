@@ -27,13 +27,17 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import type { BmppConfig } from './config.ts'
 import {
-  appendAudit,
   decisionPayload,
   recallPayload,
   type AuditContext,
-  type AuditSession,
   type EnforcementRecord,
 } from './audit.ts'
+import {
+  type AuditDropReason,
+  type AuditSink,
+  type SealedAuditPayload,
+} from './audit-sink.ts'
+import { DroppedAuditSink, resolveAuditSink } from './audit-store.ts'
 import {
   CLASSIFY_TOOL,
   decide,
@@ -100,17 +104,18 @@ interface SessionEntry {
 export interface GateOptions {
   readonly ctx: Context
   readonly config: BmppConfig
-}
-
-/**
- * Present any session-like value as the append surface the audit needs.
- *
- * The cast is deliberate and narrow: the gate depends on `append` and `id` and
- * on nothing else, so a host whose session type differs still works as long as
- * it can persist an event.
- */
-function asAuditSession(session: object): AuditSession {
-  return session as unknown as AuditSession
+  /**
+   * Audit sink to write through. Omitted builds a dropping sink, so a caller
+   * that has not resolved the optional storage service still gets a working
+   * gate that reports what it could not persist.
+   */
+  readonly auditSink?: AuditSink
+  /**
+   * Whether to register listeners immediately. `false` builds the gate without
+   * mounting it, which is what the plugin's own load path needs: the audit sink
+   * must be resolved before the listeners start producing records.
+   */
+  readonly mount?: boolean
 }
 
 /** Model-facing description of the classification tool. */
@@ -181,7 +186,10 @@ export class BmppGate {
   private readonly config: BmppConfig
   private readonly sessions = new Map<string, SessionEntry>()
   private readonly audit: AuditContext
+  private auditSink: AuditSink
   private auditFailures = 0
+  /** Plugin-local audit ordering; monotonic across every session in the process. */
+  private sequence = 0
 
   constructor(options: GateOptions) {
     this.ctx = options.ctx
@@ -191,6 +199,10 @@ export class BmppGate {
       profile: options.config.profile,
       pluginVersion: BMPP_VERSION,
     }
+    // Until the mount path resolves storage, records are reported as dropped
+    // rather than silently lost. A gate built directly (tests, diagnostics)
+    // therefore behaves exactly like a host without the storage service.
+    this.auditSink = options.auditSink ?? new DroppedAuditSink('storage-unavailable')
   }
 
   /** Number of sessions currently tracked; exposed for leak assertions. */
@@ -199,7 +211,7 @@ export class BmppGate {
   }
 
   /**
-   * How many audit appends failed.
+   * How many audit records were dropped.
    *
    * A non-zero value means decisions happened without a durable record, which
    * is worth surfacing — but it never changed a verdict, by design.
@@ -209,18 +221,78 @@ export class BmppGate {
   }
 
   /**
-   * Write one audit event, swallowing every failure.
+   * The sink the gate writes audit through.
    *
-   * The policy must not become less reliable because the log did: a broken
-   * append is counted and reported once per session by the caller, and the
-   * verdict stands.
+   * Defaults to the dropping sink so a gate constructed without storage still
+   * decides normally and reports what it lost. The mount path replaces it with
+   * a durable sink once the optional storage service has been resolved.
+   *
+   * @param sink - the sink to persist audit records through.
    */
-  private emit(session: AuditSession, payload: Parameters<typeof appendAudit>[1]): void {
-    const result = appendAudit(session, payload)
-    if (!result.ok) {
-      this.auditFailures += 1
-      this.ctx.logger?.warn('bmpp: audit event dropped (%s)', result.error)
-    }
+  setAuditSink(sink: AuditSink): void {
+    this.auditSink = sink
+  }
+
+  /** Resolve once every accepted audit record is durable. */
+  flushAudit(): Promise<void> {
+    return this.auditSink.flush()
+  }
+
+  /**
+   * Resolve once the sink has stopped waiting for the storage service.
+   *
+   * Independent of `flushAudit`: a sink that is still buffering has nothing to
+   * flush yet, so a caller that wants the audit settled waits here first. A
+   * host that never provides storage would wait forever, which is why
+   * {@link abandonAudit} exists for a caller that knows the composition.
+   */
+  settleAudit(): Promise<void> {
+    return this.auditSink.whenSettled()
+  }
+
+  /**
+   * Declare that the storage service is not coming, reporting what was buffered.
+   *
+   * The composition knows this and the plugin does not: a host either mounts the
+   * storage rows or it does not. Calling this stops the wait and surfaces the
+   * loss at a known point instead of at teardown. It is idempotent, and a sink
+   * that already persists ignores it.
+   */
+  abandonAudit(): void {
+    this.auditSink.abandon?.()
+  }
+
+  /**
+   * Seal one audit payload with its session coordinates and enqueue it.
+   *
+   * The policy must not become less reliable because the audit store did: a
+   * dropped record is counted and reported, and the verdict stands. Nothing
+   * here awaits the medium, so no tool call is delayed by it.
+   */
+  private emit(sessionId: string, payload: SealedAuditPayload): void {
+    this.sequence += 1
+    const result = this.auditSink.record({
+      sessionId,
+      seq: this.sequence,
+      recordedAt: Date.now(),
+      payload,
+    })
+    if (!result.ok) this.reportAuditDrop(result.reason, result.error)
+  }
+
+  /**
+   * Count one dropped audit record and say why, once per drop.
+   *
+   * Reported rather than thrown: the caller is the tool-call path, and an audit
+   * outage must never surface as a tool failure.
+   */
+  reportAuditDrop(reason: AuditDropReason, error?: string): void {
+    this.auditFailures += 1
+    this.ctx.logger?.warn(
+      'bmpp: audit event dropped (%s)%s',
+      reason,
+      error === undefined ? '' : `: ${error}`,
+    )
   }
 
   /**
@@ -288,7 +360,7 @@ export class BmppGate {
       enforced: directive !== undefined,
       auditOverride,
     }
-    this.emit(asAuditSession(session), decisionPayload(step.event, this.audit, record))
+    this.emit(sessionId, decisionPayload(step.event, this.audit, record))
 
     return { reasonCode: step.reasonCode, directive, auditOverride }
   }
@@ -336,7 +408,7 @@ export class BmppGate {
     // decision that opened it, so it is its own event rather than a mutation of
     // the earlier one.
     const resolution = resolveTurn(this.projections(), agent.session, entry.harnessTurn)
-    this.emit(asAuditSession(agent.session), recallPayload(state, exec.name, outcome, this.audit, resolution.turn))
+    this.emit(sessionId, recallPayload(state, exec.name, outcome, this.audit, resolution.turn))
   }
 
   /** Release per-session state when the store reports the session gone. */
@@ -363,6 +435,18 @@ export class BmppGate {
     })
 
     this.ctx.tools.register(this.classifyTool())
+  }
+
+  /**
+   * Release the audit store on plugin disposal.
+   *
+   * The sink drains before the domain is closed, so a plugin stopped between a
+   * decision and its write still lands that record. Registered as its own effect
+   * rather than folded into {@link mount} so the store's lifecycle is visible
+   * where it is owned.
+   */
+  disposeAudit(): Promise<void> {
+    return this.auditSink.close()
   }
 
   /**
@@ -418,13 +502,15 @@ function withTurn(state: PolicySessionState, turn: number): PolicySessionState {
 }
 
 /**
- * Create and mount the gate.
+ * Build an UNMOUNTED gate.
  *
- * @param options - the host context and the validated configuration.
+ * The caller attaches an audit sink and then calls `mount()`. That ordering is
+ * deliberate: a listener registered before the sink is set could audit a
+ * decision into the dropping sink and lose it silently.
+ *
+ * @param options - the host context, the validated configuration and an optional sink.
  * @returns the gate, so a test can inspect its state and drive it directly.
  */
 export function createGate(options: GateOptions): BmppGate {
-  const gate = new BmppGate(options)
-  gate.mount()
-  return gate
+  return new BmppGate(options)
 }

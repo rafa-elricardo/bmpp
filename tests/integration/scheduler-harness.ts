@@ -43,6 +43,7 @@ import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { apply, type BmppLoadReport } from '../../src/index.ts'
+import { auditDomainDouble } from '../support/audit-domain.ts'
 
 /** One recorded step of the observed interleaving. */
 export interface TimelineEntry {
@@ -247,7 +248,12 @@ export async function mountHarness(options: HarnessOptions): Promise<Harness> {
   const adapter = new ScriptedAdapter()
   ctx.llm.registerAdapter(['scripted'], adapter)
 
-  const report = apply(ctx, options.bmpp ?? { mode: 'enforce', profile: 'compat', policyVersion: '0.1.0' })
+  // The plugin's real storage sink, so policy events are read from the sidecar
+  // exactly where production writes them.
+  const audit = auditDomainDouble()
+  ctx.provide('storageDomain' as never, audit.facility as never)
+
+  const report = await apply(ctx, options.bmpp ?? { mode: 'enforce', profile: 'compat', policyVersion: '0.1.0' })
 
   /** Register one fixture tool whose body the harness records and gates. */
   const register = (spec: ToolSpec): void => {
@@ -309,9 +315,9 @@ export async function mountHarness(options: HarnessOptions): Promise<Harness> {
     report,
     timeline: timeline_snapshot,
     timelineFor: (label: string) => timeline.filter(entry => entry.label === label),
-    policyEvents: () => drain()
-      .filter(event => event.type === 'bmpp/policy')
-      .map(event => event.data as Record<string, unknown>),
+    // Read from the audit sidecar: BMPP writes no session event, so the session
+    // log must not be where this harness looks for policy decisions.
+    policyEvents: () => audit.records.map(entry => entry.payload as unknown as Record<string, unknown>),
     toolResults: () => drain()
       .filter(event => event.type === 'tool/result')
       .map((event) => {
