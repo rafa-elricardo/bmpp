@@ -18,6 +18,7 @@ Data: 2026-09-16 · Autor: agente DSH · Status: **revisão 3 aprovada como base
 |---|---|---|---|
 | 1 | 2026-09-16 | Projeto inicial (26 seções) | maintainer (as the architectural baseline) |
 | 2 | 2026-09-16 | Local do plugin fixado em `packages/bmpp/`; modelo de configuração normalizado (`mode` × `profile`); `bmpp__classify` deixa de exigir posição de primeira chamada; escopo do MVP fixado em Basic Memory; `ask` só em `profile: strict`; defaults `mode: audit` + `profile: compat`; estado do Git registrado | maintainer |
+| 6 | 2026-09-16 | **Fase 2 concluída**: tracker de escrita passa a distinguir origem e destino (corrige a lacuna em `move_note`); premissa incorreta do scheduler em §6.4 corrigida e garantias reais registradas em §7.5; semântica de turno e classificação medida em §7.6; verificação independente em Python do stream de decisões | maintainer |
 | 5 | 2026-09-16 | **Incremento 1d implementado**: eventos duráveis `bmpp/policy` com duas formas (`pre-execute` e `recall`), append isolado do veredito, e a separação explícita entre `policyTurn` e `harnessTurn` documentada em §13.1 | maintainer |
 | 4 | 2026-09-16 | **Incremento 1c implementado**: o gate foi montado sobre `tools/pre-execute`, `tools/result`, `session/disposed` e a ferramenta `bmpp__classify`; duas adaptações ao runtime real registradas em §7.4 | maintainer |
 | 3 | 2026-09-16 | **BMPP passa a ser um projeto standalone** em `<workspace>/bmpp/`, com repositório Git próprio e versionamento independente; o checkout do DSH permanece clone oficial, sem fork, sem branch e sem alteração; forma de distribuição confirmada como *bundle* (`dsh.bundle`); estratégia de compatibilidade e de licença definidas; documentação arquitetural migrada para dentro do repositório do BMPP | maintainer |
@@ -418,17 +419,23 @@ Isso é deliberado.
 
 ### 6.4 Gates, ordem e paralelismo
 
-Fatos que definem o desenho:
+Fatos que definem o desenho, **corrigidos na Fase 2 contra o código e contra medições reais**
+(§7.5):
 
-- O `agent-loop` chama `prepareExecution` de todas as chamadas do lote **antes** de despachar
-  (`packages/core/agent-loop/src/tool-calls.ts`: "Ordered pre-execute may await; only
-  dispatch/body overlaps"). O comentário do módulo confirma: "parallel calls use a bounded rolling
-  pool and are reclassified before start".
-- Portanto, no instante do `tools/pre-execute` de uma chamada do lote, **nenhuma** outra chamada do
-  mesmo lote executou seu corpo ainda.
+- O `agent-loop` **não** completa o pre-execute de todo o lote antes de despachar. `fillPool()`
+  chama `startCall`, que faz `prepare` (o waterfall `tools/pre-execute`) e, em seguida, `dispatch`
+  da **mesma** call antes de preparar a seguinte. O scheduler é um **pool rolante** de até
+  `maxParallelToolCalls` (default 10), e o próprio módulo o descreve como "parallel calls use a
+  bounded rolling pool and are reclassified before start".
+- **A premissa anterior deste capítulo estava errada.** Ela afirmava que "no instante do
+  `tools/pre-execute` de uma chamada do lote, nenhuma outra chamada do mesmo lote executou seu
+  corpo ainda". Isso não é uma garantia do runtime: corpos de calls paralelas **podem** sobrepor-se.
+  O que o runtime garante é outra coisa, verificada em §7.5.
 
-Consequência: um lote que contenha `search_notes` **e** `write_note` **não pode** satisfazer o gate
-para a escrita — a busca ainda não concluiu quando a escrita é avaliada. O BMPP então:
+Consequência, que **continua valendo na prática**: um lote que contenha `search_notes` **e**
+`write_note` é negado para a escrita, porque o resultado da busca não está disponível no instante
+em que a escrita é avaliada. Isso foi medido diretamente — inclusive com o lote cruzando a
+fronteira do pool — e o veredito é estável. O BMPP então:
 
 - **permite** a consulta (read-only);
 - **nega** a mutação com `reason_code: MEMORY_LOOKUP_PENDING_IN_BATCH` e uma instrução explícita:
@@ -551,6 +558,47 @@ criação da sessão. Adaptação implementada: **inicialização preguiçosa** 
 chamada de ferramenta da sessão, mais reset por **avanço do turno** (`turnBoundary.lastTurn`), o que
 produz o mesmo efeito — todo turno novo nasce `UNKNOWN`. O descarte do estado por sessão usa
 `session/disposed`, que é um sinal real e não escopado.
+
+### 7.5 Garantias reais do scheduler (medidas na Fase 2)
+
+Substituem a premissa incorreta que este capítulo trazia. Cada item foi verificado contra o código
+de `packages/core/agent-loop/src/tool-calls.ts` **e** por medição com o agent-loop real
+(`tests/integration/scheduler.spec.ts`).
+
+| Garantia | Estado |
+|---|---|
+| O pre-execute de uma call acontece antes do **dispatch da própria call** | garantido |
+| Corpos de calls paralelas **podem sobrepor-se**; o pre-execute de uma call posterior pode rodar enquanto o corpo de uma anterior executa | garantido (e não é uma barreira) |
+| O scheduler usa **pool rolante**, reabastecido a cada commit, com `maxParallelToolCalls` (default 10) | garantido |
+| Resultados são commitados em **ordem de modelo**, nunca na ordem de término | garantido |
+| Um `deny` **não aborta** o restante do grupo: as demais calls seguem e só a negada vira resultado de erro | garantido |
+| O log durável é `tool/call`×N seguido de `tool/result`×N, em ordem de modelo | garantido |
+
+Timeline medida, com corpos sincronizados por barreira (não por espera arbitrária):
+
+```
+PRE-slow1 | BODY1-enter | PRE-slow2 | BODY2-enter | PRE-denied | BODY1-exit
+  | RESULT-slow1 | BODY2-exit | RESULT-slow2 | RESULT-denied
+```
+
+`PENDING_IN_BATCH` **não** depende de "o lote inteiro já passou pelo pre-execute". Depende de um
+fato mais simples e mais forte: **o recall está `in_flight` quando a mutação é avaliada**, porque o
+resultado da busca ainda não chegou. É por isso que o veredito se mantém mesmo quando o lote excede
+o pool e a escrita é julgada em uma onda posterior — medido com 13 calls em uma única mensagem.
+
+O gate **não** identifica lotes: ele lê o sub-estado de recall que ele mesmo mantém. Não há
+dependência de tamanho de lote, fronteira de pool nem número de `step`.
+
+### 7.6 Turnos e classificação (medidos na Fase 2)
+
+- **Cada `followup` / nova mensagem do usuário abre um turno NOVO do Harness.** Um turno pode ter
+  vários passos do modelo (uma classificação seguida de um lote no mesmo turno, por exemplo), e
+  esses passos compartilham o mesmo `turn/start`.
+- **A classificação pertence ao turno.** Medido: classificar no turno 1 e tentar mutar no turno 2
+  produz `CLASSIFICATION_REQUIRED`, porque o reset de turno descarta classificação e recall.
+- Consequência prática para o modelo: **classificar em um turno não libera mutação em um turno
+  posterior.** Para classificar e mutar, ambos precisam estar no mesmo turno — o que é o
+  comportamento projetado, agora com evidência.
 
 ### 7.3 Transições e reset
 
@@ -814,6 +862,15 @@ result, then retry this call. If the turn is genuinely SIMPLE, call bmpp__classi
 | `SECRET_PATTERN_DETECTED` | argumento casa padrão óbvio de segredo (heurística) | remover o segredo do conteúdo | default `warn`; `strict` → `deny`; `audit` → warn |
 | `TEST_FIXTURE_LABEL_IN_PROJECT` | `[test-fixture]` em nota fora de diretório de testes | remover o rótulo | default `warn`; `strict` → `deny`; `audit` → warn |
 | `POLICY_INTERNAL_ERROR` | exceção inesperada no próprio gate | — (auditado; ver §19) | `open` + auditoria |
+
+**Nota sobre `UNKNOWN_MEMORY_TOOL` (medido na Fase 2).** O código existe no vocabulário fechado de
+`src/reason-codes.ts`, mas o núcleo de decisão **nunca o emite**. Uma ferramenta dentro do namespace
+que nenhuma lista classifica é tratada como mutação e fail-closed, porém o motivo reportado é a
+**pré-condição aplicável** — `CLASSIFICATION_REQUIRED` em turno não classificado,
+`MEMORY_LOOKUP_REQUIRED` em turno COMPLEX sem busca, e assim por diante. A escolha é deliberada: o
+modelo recebe a instrução acionável que falta cumprir, em vez de um código que apenas nomeia a
+categoria. `tools/bmpp_verify.py` trava isso com a regra R11 — o código não pode começar a aparecer
+no stream sem uma decisão explícita.
 
 Antes da tabela, a regra que resolve `mode` × `profile` de forma não ambígua:
 
@@ -1094,7 +1151,7 @@ Princípios:
 | 16 | tentativa de registrar segredo | L1 | padrão óbvio em argumento → `SECRET_PATTERN_DETECTED`; evento **não** contém o valor |
 | 17 | restart/reload do plugin | L2 | novo `apply` → estado vazio → turno `UNKNOWN` → mutação negada (fail-closed); disposer remove listeners sem vazar |
 | 18 | mudança de versão da política | L1+L2 | `policyVersion` diferente aparece nos eventos; estado antigo é descartado no reload |
-| 19 | chamadas malformadas/inesperadas | L1 | `exec.name` desconhecido no namespace → fail-closed (`UNKNOWN_MEMORY_TOOL`); `arguments` não-objeto → não lança, trata como desconhecido e audita |
+| 19 | chamadas malformadas/inesperadas | L1 | `exec.name` não classificado dentro do namespace → fail-closed pela pré-condição aplicável (`CLASSIFICATION_REQUIRED` / `MEMORY_LOOKUP_REQUIRED`); `arguments` não-objeto → não lança, trata como desconhecido e audita |
 | 20 | regressão dos 12 cenários/20 regras | L5 | `policy_verify.py policy_spec.json` continua **0 falhas**; as regras agora cobertas pelo BMPP ganham asserção dupla (evento + verifier) |
 | **21** | **`mode: audit` não bloqueia** | L2 | com `mode: audit`, todo cenário de deny (3, 4, 10) passa a **allow** com `auditOverride: true` no evento — é o default aprovado, então este teste é o que garante que o default é inofensivo |
 | **22** | **`profile` não altera `mode`** | L1 | `audit+strict` → permite e registra deny; `enforce+strict` → nega; `enforce+compat` → secundários em `warn`; nenhuma combinação muda `mode` por conta própria |
@@ -1223,7 +1280,7 @@ Decisão por categoria — nunca uniforme.
 | Eventos duplicados (`tools/result` repetido) | idempotência | transições de recall são idempotentes; contadores idempotentes por `callId` | repetir "ok" mantém `ok` |
 | Cache stale (read-after-write) | integridade | **allow** e nenhuma ação; documentado | §4.2/§16-E: não é problema do BMPP e a "correção" (escrever de novo) é proibida |
 | Metadados ausentes (`exec.agent` indefinido) | integridade | **no-op (allow)** + auditoria `NO_AGENT_CONTEXT` | sem agente não há turno; bloquear seria bloquear fora de contexto |
-| Ferramenta desconhecida **no namespace de memória** | política | **fail-closed** (`UNKNOWN_MEMORY_TOOL`) | princípio: novidade não abre buraco |
+| Ferramenta desconhecida **no namespace de memória** | política | **fail-closed** pela pré-condição aplicável (não por `UNKNOWN_MEMORY_TOOL`, que não é emitido — ver nota em §12.3) | princípio: novidade não abre buraco |
 | Ferramenta desconhecida **fora** do namespace | escopo | **allow** + auditoria (nível `verbose`) | fora do escopo do BMPP |
 | Atualização da versão do plugin | ciclo de vida | estado descartado no reload; `pluginVersion`/`policyVersion` novos em todo evento | permite correlação histórica |
 | **Exceção no próprio gate** | defeito | **fail-open + auditoria obrigatória `POLICY_INTERNAL_ERROR`** | um bug no plugin não pode parar o Harness; a auditoria torna o defeito visível e o teste dedicado o pega |

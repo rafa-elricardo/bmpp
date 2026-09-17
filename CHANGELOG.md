@@ -48,6 +48,17 @@ by an explicit envelope, never by version equality — see [docs/COMPATIBILITY.m
   `archive/` behaviour — including the write-tracking gap for moves, asserted as
   an observed limitation rather than papered over.
 
+- `move_note` tracking: a state-changing memory operation is now identified by
+  **tool + origin + destination**, where the destination records whether it came
+  from `destination_path` or `destination_folder`. Two moves of one note to two
+  different places are two operations; the same move twice is one. The recall
+  gate, the reason codes, the classification of `move_note` and its
+  non-destructive status are unchanged.
+- `tools/emit-policy-stream.mts` and `tools/bmpp_verify.py` — an independent
+  regression layer over the durable `bmpp/policy` stream: the emitter drives the
+  real pipeline and writes the events, the verifier checks the record's
+  invariants in Python without sharing code with the implementation.
+
 ### Notes
 
 - **Gate mounted, audit durable, not yet installed anywhere.** The policy is enforced in-process and
@@ -57,6 +68,10 @@ by an explicit envelope, never by version equality — see [docs/COMPATIBILITY.m
   search tool, so an empty-but-successful search is indistinguishable from a populated one and BMPP
   refuses to parse content text to guess. `RECALL_EMPTY` stays modelled but unreachable; see
   `docs/ARCHITECTURE.md` §7.4(a).
+- **`UNKNOWN_MEMORY_TOOL` is never emitted.** The code stays in the closed
+  vocabulary, but an unclassified tool inside the memory namespace fails closed
+  through the applicable precondition code, so the model receives the actionable
+  instruction. `tools/bmpp_verify.py` rule R11 enforces that.
 - **Secondary guards still pending.** The overwrite-without-read guard is enforced (except under
   `profile: strict`, where behaviour is unchanged); the secret-pattern and test-fixture guards are
   not implemented yet.

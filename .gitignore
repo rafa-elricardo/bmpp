@@ -13,6 +13,10 @@ yarn.lock
 coverage/
 *.tsbuildinfo
 
+# Generated policy stream: evidence produced by tools/emit-policy-stream.mts and
+# checked by tools/bmpp_verify.py. Reproduce it, do not version it.
+tools/policy-stream.jsonl
+
 # Logs and local runtime state
 *.log
 *.local

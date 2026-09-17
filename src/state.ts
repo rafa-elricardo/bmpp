@@ -322,6 +322,50 @@ function readBooleanArg(args: unknown, key: string): boolean {
   return (args as Record<string, unknown>)[key] === true
 }
 
+/**
+ * The origin a write acts on: the path for `write_note`, otherwise the exact
+ * identifier the caller supplied.
+ *
+ * `identifier` is an exact-match handle in this server (title, permalink or
+ * `memory://` URL), so it is a stable identity without any path resolution BMPP
+ * cannot perform.
+ */
+function writeOrigin(args: unknown): string | undefined {
+  return readStringArg(args, 'file_path') ?? readStringArg(args, 'identifier')
+}
+
+/**
+ * The destination a MOVE targets, tagged with which argument named it.
+ *
+ * `destination_path` and `destination_folder` are different operations — one
+ * renames, the other preserves the filename inside a folder — so they must not
+ * collapse into the same identity even when their strings coincide. The tag is
+ * part of the key, not decoration.
+ */
+function writeDestination(args: unknown): string {
+  const path = readStringArg(args, 'destination_path')
+  if (path !== undefined) return `path:${path}`
+  const folder = readStringArg(args, 'destination_folder')
+  if (folder !== undefined) return `folder:${folder}`
+  return 'none'
+}
+
+/**
+ * The deterministic identity of one state-changing memory operation.
+ *
+ * Deliberately three separable facts — which tool, which origin, which
+ * destination — so that repeating the same operation is recognized as the same
+ * operation, and the same note moved to two different places is recognized as
+ * two. No note content, no physical path resolution, no heuristic: every
+ * component comes straight from the arguments or is `none`.
+ *
+ * @param tool - the public tool name.
+ * @param args - the call's arguments, possibly malformed.
+ */
+export function memoryWriteKey(tool: string, args: unknown): string {
+  return [tool, writeOrigin(args) ?? '<unknown>', writeDestination(args)].join('\u0000')
+}
+
 /** Matched tool classes for one call. */
 interface ToolClass {
   readonly control: boolean
@@ -564,17 +608,17 @@ function decideMemoryWrite(
   context: Required<DecisionContext>,
 ): PolicyStep {
   const recall = turn.recall
-  const path = readStringArg(call.args, 'file_path') ?? readStringArg(call.args, 'identifier')
+  const origin = writeOrigin(call.args)
   const isCreate = call.tool === 'mcp__basic-memory__write_note' && !readBooleanArg(call.args, 'overwrite')
 
-  const denial = findWriteDenial(turn, context, recall, isCreate, call.args, path)
+  const denial = findWriteDenial(turn, context, recall, isCreate, call.args, origin)
   if (denial !== undefined) {
     const blockedTurn: PolicyTurnState = { ...turn, calls: { ...turn.calls, blocked: turn.calls.blocked + 1 } }
     const event = buildEvent(context, call.tool, toolClass, blockedTurn, 'deny', denial, undefined)
     return { decision: 'deny', reasonCode: denial, event, state: { ...state, turn: blockedTurn } }
   }
 
-  const writeKey = `${call.tool}\u0000${path ?? '<unknown>'}`
+  const writeKey = memoryWriteKey(call.tool, call.args)
   const writes = { ...turn.writes }
   writes[writeKey] = (writes[writeKey] ?? 0) + 1
   const allowedTurn: PolicyTurnState = { ...turn, writes }

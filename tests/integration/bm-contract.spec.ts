@@ -422,8 +422,8 @@ describe('archive is a destination convention, not a mechanism', () => {
   })
 })
 
-describe('the write-tracking gap for moves is real', () => {
-  it('keys a move by its identifier, not by its destination or its file path', async () => {
+describe('the write tracker sees a move destination', () => {
+  it('distinguishes two moves of one note to different destinations', async () => {
     await withBridge({
       handlers: { search_notes: () => ({ text: 'ok' }) },
     }, async (bridge) => {
@@ -432,26 +432,81 @@ describe('the write-tracking gap for moves is real', () => {
       await bridge.call(MOVE, { identifier: 'Note A', destination_path: 'archive/A.md' })
       await bridge.call(MOVE, { identifier: 'Note A', destination_path: 'archive/B.md' })
 
-      // Both moves happened, so BMPP permitted them — but the arguments show the
-      // gap: the tracker sees only `identifier`, so the DESTINATION is invisible
-      // to it, and two moves of one note to two different places are
-      // indistinguishable from one another in the guard's bookkeeping.
+      // Both moves really ran and both were permitted.
       const calls = bridge.received.get('move_note') ?? []
       expect(calls.map(call => call['destination_path'])).toEqual(['archive/A.md', 'archive/B.md'])
       expect(calls[0]?.['identifier']).toBe(calls[1]?.['identifier'])
-      // The audit trail consequently reports the same tool, class and reason for
-      // both: nothing in it says the destination changed.
+
+      // The identity now carries the destination, so the two operations are two:
+      // the tracker can tell them apart without reading a single note.
+      const state = bridge.report.gate?.stateOf(String(bridge.session.id))
+      const keys = Object.keys(state?.turn.writes ?? {})
+      expect(keys).toHaveLength(2)
+      expect(keys.some(key => key.includes('path:archive/A.md'))).toBe(true)
+      expect(keys.some(key => key.includes('path:archive/B.md'))).toBe(true)
+
+      // The audit trail still reports the same tool and class — the destination
+      // is the GUARD's business, not the audit payload's.
       const moveEvents = decisions(bridge).filter(event => event['tool'] === MOVE)
       expect(moveEvents).toHaveLength(2)
-      expect(moveEvents[0]?.['reasonCode']).toBe(moveEvents[1]?.['reasonCode'])
       expect(moveEvents[0]?.['toolClass']).toBe('memory.write')
-
-      // The gate's write tracker keys on `identifier`; a move carries no
-      // `file_path`, so the destination cannot reach the key at all. The audit
-      // payload proves it from the outside: it has no field that could hold it.
       for (const payload of auditPayloads(bridge)) {
         expect(Object.keys(payload)).not.toContain('destination_path')
         expect(Object.keys(payload)).not.toContain('destination')
+      }
+    })
+  })
+
+  it('treats a repeated identical move as the same operation', async () => {
+    await withBridge({
+      handlers: { search_notes: () => ({ text: 'ok' }) },
+    }, async (bridge) => {
+      await bridge.call('bmpp__classify', { task: 'complex' })
+      await bridge.call(SEARCH, { query: 'note' })
+      await bridge.call(MOVE, { identifier: 'Note', destination_path: 'archive/Note.md' })
+      await bridge.call(MOVE, { identifier: 'Note', destination_path: 'archive/Note.md' })
+
+      const state = bridge.report.gate?.stateOf(String(bridge.session.id))
+      const writes = state?.turn.writes ?? {}
+      expect(Object.keys(writes)).toHaveLength(1)
+      expect(Object.values(writes)).toEqual([2])
+    })
+  })
+
+  it('keeps destination_folder distinct from destination_path', async () => {
+    await withBridge({
+      handlers: { search_notes: () => ({ text: 'ok' }) },
+    }, async (bridge) => {
+      await bridge.call('bmpp__classify', { task: 'complex' })
+      await bridge.call(SEARCH, { query: 'note' })
+      await bridge.call(MOVE, { identifier: 'Note', destination_path: 'archive' })
+      await bridge.call(MOVE, { identifier: 'Note', destination_folder: 'archive' })
+
+      const state = bridge.report.gate?.stateOf(String(bridge.session.id))
+      const keys = Object.keys(state?.turn.writes ?? {})
+      expect(keys).toHaveLength(2)
+      expect(keys.some(key => key.includes('path:archive'))).toBe(true)
+      expect(keys.some(key => key.includes('folder:archive'))).toBe(true)
+    })
+  })
+
+  it('never records note content in the write identity', async () => {
+    await withBridge({
+      handlers: { search_notes: () => ({ text: 'ok' }) },
+    }, async (bridge) => {
+      const secret = 'note body that must never reach the tracker'
+      await bridge.call('bmpp__classify', { task: 'complex' })
+      await bridge.call(SEARCH, { query: 'note' })
+      await bridge.call(WRITE, { title: 'T', content: secret, directory: 'D', file_path: 'Notes/T.md' })
+      await bridge.call(MOVE, { identifier: 'Note', destination_path: 'archive/Note.md' })
+
+      const state = bridge.report.gate?.stateOf(String(bridge.session.id))
+      const serialized = JSON.stringify(state?.turn.writes ?? {})
+      expect(serialized).not.toContain(secret)
+      expect(serialized).not.toContain('note body')
+      // The identity is tool + origin + destination, and nothing else.
+      for (const key of Object.keys(state?.turn.writes ?? {})) {
+        expect(key.split('\u0000')).toHaveLength(3)
       }
     })
   })

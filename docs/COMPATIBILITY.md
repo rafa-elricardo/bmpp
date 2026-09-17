@@ -85,9 +85,10 @@ are unit-testable without a Harness process.
 
 ### A Harness-side limitation the gate lives with
 
-The MCP bridge does not forward a server's `outputSchema` when it cannot map it, and the Basic
-Memory server advertises none for `search_notes`. The only structured signal BMPP receives about a
-recall is therefore `isError`.
+Every one of Basic Memory 0.23.2's 21 tools advertises `outputSchema: null` (verified against a
+live `tools/list`), so the bridge projects no `structuredContent` and the canonical value BMPP sees
+is `McpResult` carrying text blocks only. The sole structured signal about a recall is therefore
+`isError`.
 
 Consequently the integration maps a recall to `ok` or `failed`, and an empty-but-successful search
 is recorded as `ok`. That is safe for the policy — any non-error result satisfies the recall

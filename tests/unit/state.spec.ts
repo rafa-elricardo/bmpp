@@ -28,6 +28,7 @@ import {
   initialState,
   onRecallResult,
   onSessionStart,
+  memoryWriteKey,
   onTurnStart,
   type CallInput,
   type DecisionContext,
@@ -444,12 +445,90 @@ describe('create and overwrite guards', () => {
     expect(step.decision).toBe('allow')
   })
 
-  it('records writes per tool and path, without touching note content', () => {
+  it('records writes by tool, origin and destination, without touching note content', () => {
     const step = decide(complexWithRecall('ok'), write('a.md'), CONTEXT)
-    expect(step.state.turn.writes).toEqual({ 'mcp__basic-memory__write_note\u0000a.md': 1 })
+    expect(step.state.turn.writes).toEqual({ 'mcp__basic-memory__write_note\u0000a.md\u0000none': 1 })
     const second = decide(step.state, write('a.md'), CONTEXT)
-    expect(second.state.turn.writes).toEqual({ 'mcp__basic-memory__write_note\u0000a.md': 2 })
+    expect(second.state.turn.writes).toEqual({ 'mcp__basic-memory__write_note\u0000a.md\u0000none': 2 })
     expect(JSON.stringify(second.event)).not.toContain('content')
+  })
+})
+
+describe('the write identity distinguishes origin from destination', () => {
+  const move = (args: Record<string, unknown>): CallInput => ({ tool: 'mcp__basic-memory__move_note', args })
+
+  /** Key shape helper: the three separable facts, in order. */
+  const key = (tool: string, origin: string, destination: string): string =>
+    `${tool}\u0000${origin}\u0000${destination}`
+
+  it('treats the same note moved to the same place twice as ONE operation', () => {
+    const first = decide(complexWithRecall('ok'), move({ identifier: 'Note', destination_path: 'archive/A.md' }), CONTEXT)
+    expect(first.decision).toBe('allow')
+    const second = decide(first.state, move({ identifier: 'Note', destination_path: 'archive/A.md' }), CONTEXT)
+    expect(second.decision).toBe('allow')
+    expect(second.state.turn.writes).toEqual({
+      [key('mcp__basic-memory__move_note', 'Note', 'path:archive/A.md')]: 2,
+    })
+  })
+
+  it('distinguishes the same note moved to two different destinations', () => {
+    const first = decide(complexWithRecall('ok'), move({ identifier: 'Note', destination_path: 'archive/A.md' }), CONTEXT)
+    const second = decide(first.state, move({ identifier: 'Note', destination_path: 'archive/B.md' }), CONTEXT)
+    expect(second.decision).toBe('allow')
+    expect(second.state.turn.writes).toEqual({
+      [key('mcp__basic-memory__move_note', 'Note', 'path:archive/A.md')]: 1,
+      [key('mcp__basic-memory__move_note', 'Note', 'path:archive/B.md')]: 1,
+    })
+  })
+
+  it('keeps destination_path and destination_folder distinct even for the same string', () => {
+    const viaPath = decide(complexWithRecall('ok'), move({ identifier: 'Note', destination_path: 'archive' }), CONTEXT)
+    const viaFolder = decide(viaPath.state, move({ identifier: 'Note', destination_folder: 'archive' }), CONTEXT)
+    expect(viaFolder.decision).toBe('allow')
+    expect(Object.keys(viaFolder.state.turn.writes).sort()).toEqual([
+      key('mcp__basic-memory__move_note', 'Note', 'folder:archive'),
+      key('mcp__basic-memory__move_note', 'Note', 'path:archive'),
+    ].sort())
+  })
+
+  it('distinguishes archive/A from archive/B', () => {
+    const a = decide(complexWithRecall('ok'), move({ identifier: 'N', destination_path: 'archive/A.md' }), CONTEXT)
+    const b = decide(a.state, move({ identifier: 'N', destination_path: 'archive/B.md' }), CONTEXT)
+    expect(Object.keys(b.state.turn.writes)).toHaveLength(2)
+  })
+
+  it('marks a move with no destination as its own identity rather than colliding', () => {
+    const bare = decide(complexWithRecall('ok'), move({ identifier: 'Note' }), CONTEXT)
+    expect(bare.state.turn.writes).toEqual({
+      [key('mcp__basic-memory__move_note', 'Note', 'none')]: 1,
+    })
+  })
+
+  it('exposes the identity through a documented pure helper', () => {
+    expect(memoryWriteKey('mcp__basic-memory__write_note', { file_path: 'a.md' }))
+      .toBe(key('mcp__basic-memory__write_note', 'a.md', 'none'))
+    expect(memoryWriteKey('mcp__basic-memory__move_note', { identifier: 'N', destination_folder: 'archive' }))
+      .toBe(key('mcp__basic-memory__move_note', 'N', 'folder:archive'))
+    // Malformed input still yields a deterministic key.
+    expect(memoryWriteKey('t', null)).toBe(key('t', '<unknown>', 'none'))
+    expect(memoryWriteKey('t', 'not-an-object')).toBe(key('t', '<unknown>', 'none'))
+  })
+
+  it('leaves the overwrite guard reading the ORIGIN, not the destination', () => {
+    const state = complexWithRecall('ok')
+    const moved = decide(state, move({ identifier: 'Note', destination_path: 'archive/Note.md' }), CONTEXT)
+    expect(moved.decision).toBe('allow')
+    // A move never satisfies the overwrite guard for a different note's write.
+    const overwrite = decide(moved.state, write('Other.md', true), CONTEXT)
+    expect(overwrite.reasonCode).toBe(ReasonCode.OVERWRITE_REQUIRES_READ)
+  })
+
+  it('does not change the recall gate for moves', () => {
+    const complex = decide(machine(), classify('complex'), CONTEXT).state
+    expect(decide(complex, move({ identifier: 'N', destination_path: 'archive/N.md' }), CONTEXT).reasonCode)
+      .toBe(ReasonCode.MEMORY_LOOKUP_REQUIRED)
+    const unclassified = decide(machine(), move({ identifier: 'N', destination_path: 'archive/N.md' }), CONTEXT)
+    expect(unclassified.reasonCode).toBe(ReasonCode.CLASSIFICATION_REQUIRED)
   })
 })
 
@@ -503,7 +582,7 @@ describe('unknown memory tools fail closed', () => {
     const state = complexWithRecall('ok')
     const step = decide(state, { tool: 'mcp__basic-memory__write_note', args: { overwrite: true } }, CONTEXT)
     expect(step.decision).toBe('allow')
-    expect(step.state.turn.writes).toEqual({ 'mcp__basic-memory__write_note\u0000<unknown>': 1 })
+    expect(step.state.turn.writes).toEqual({ 'mcp__basic-memory__write_note\u0000<unknown>\u0000none': 1 })
   })
 })
 
