@@ -54,11 +54,11 @@ Base de verificação (tudo lido no código vivo nesta sessão, nada inferido):
 | Componente | Versão / local |
 |---|---|
 | DeepSeek Harness | `0.1.5-rc.2`, checkout `<dsh-checkout>` (commit `c291e7961a`) |
-| Basic Memory | `0.23.2` (via `uvx`, cache `~/.cache/uv/archive-v0/<cache-entry>/basic_memory`) |
-| Perfil DSH vivo | `~/.dsh/profiles/web/` (`cordis.yml` + `cordis.patch.yml`, `patchReload: live`) |
+| Basic Memory | `0.23.2` (installed through `uvx`) |
+| DSH profile under test | `$DSH_HOME/profiles/<profile>/` (`cordis.yml` + `cordis.patch.yml`, `patchReload: live`) |
 | Notas | `$BASIC_MEMORY_ROOT` (projeto `main`), índice `$BASIC_MEMORY_HOME/` |
-| Política comportamental | `~/.dsh/AGENTS.md` + `<private-memory-note>` |
-| Suíte de verificação existente | `<private-research-directory>/policy_verify.py` + `policy_spec.json` (12 cenários) |
+| Behavioural policy | the harness agent-instruction file plus the memory-policy note it points to |
+| Pre-existing external verification suite | a standalone script plus its scenario spec (12 scenarios), maintained outside this repository |
 
 ---
 
@@ -129,7 +129,7 @@ passou a disparar — mas continua sendo *comportamento*, não *enforcement*.
 | # | Defeito | Evidência |
 |---|---|---|
 | D1 | Nada impede uma escrita de memória antes da consulta obrigatória | política é textual |
-| D2 | `[test-fixture]` vazou para dentro de notas de projeto reais (`Example Topic Decision`, `Example Project`) | notas arquivadas em `archive/policy-tests/**` |
+| D2 | `[test-fixture]` vazou para dentro de notas de projeto reais (duas notas de um projeto interno) | notas arquivadas em `archive/policy-tests/**` |
 | D3 | Permalinks duplicados (`-1`/`-2`) só são detectados por inspeção manual do modelo | `AGENTS.md` Gate 3.5 |
 | D4 | Nenhum registro estruturado de allow/block: a auditoria é arqueologia de log de sessão | `policy_verify.py` reimplementa a leitura |
 | D5 | "Primeira ferramenta = `search_notes`" é frágil: não distingue leitura de escrita, não cobre paralelismo, não define "consulta concluída" | ver §6 |
@@ -221,7 +221,7 @@ DSH, o verifier existente (`zstd -dc` + JSON por linha) já sabe ler `session.v3
 
 ## 4. Avaliação da integração atual do Basic Memory
 
-### 4.1 Nomes reais das ferramentas (21, lidos de `<private-research-directory>/tools.json`)
+### 4.1 Nomes reais das ferramentas (21, lidos do catálogo MCP do servidor)
 
 Prefixo model-facing: `mcp__basic-memory__` (`publicToolName(serverName, rawName)` em
 `packages/mcp/mcp-client/src/tools.ts`). O bridge **não** propaga

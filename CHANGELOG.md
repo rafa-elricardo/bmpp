@@ -12,68 +12,77 @@ by an explicit envelope, never by version equality — see [docs/COMPATIBILITY.m
 ### Added
 
 - Initial standalone project: `package.json` as a DSH bundle (`dsh.bundle.patch`), the
-  `cordis.patch.yml` configuration layer, an MIT `LICENSE`, editor/build configuration and a
+  `cordis.patch.yml` configuration layer, an MIT `LICENSE`, editor/build configuration, and a
   gitignore that keeps local overlays, build output and machine-specific paths out of history.
 - `src/config.ts` — the `mode` (`off` / `audit` / `enforce`) × `profile` (`compat` / `strict`)
   configuration model with a dependency-free validator, stable error codes, the approved defaults
   (`audit` + `compat`), and an explicit table of what `strict` changes and what it deliberately
   leaves alone.
 - `src/version.ts` — BMPP's own version line, the Harness compatibility envelope
-  (`>=0.1.5-rc.2 <0.2.0`), best-effort Harness version detection, and a pure compatibility
-  classifier.
-- `src/index.ts` — the Cordis plugin entry point: configuration validation, a structural probe of
-  the injected `tools` service, the load-time activation decision, and a one-line load report. It
-  registers no interception yet.
-- `docs/ARCHITECTURE.md` — the full design (migration of the working design document).
-- `docs/COMPATIBILITY.md` — the version envelope, detection strategy and re-verification procedure.
-- `docs/DISTRIBUTION.md` — the development and distribution mechanisms, the bundle installation
-  path, dependency-declaration rationale, repository hygiene and the license analysis.
-- Unit tests for the configuration model and the version classifier.
-- `src/state.ts` — the pure policy state machine and its reason-code vocabulary:
-  `decide()` returns the verdict, the reason and the audit event, with `mode` and
-  `profile` deliberately absent from its inputs.
-- `src/gate.ts` — the integration layer: `tools/pre-execute`, `tools/result`,
-  `session/disposed`, and the `bmpp__classify` control tool, registered on the
-  real Harness runtime.
-- `src/audit.ts` — durable `bmpp/policy` session events in two shapes
-  (`pre-execute` and `recall`), with `policyTurn` and `harnessTurn` kept
-  distinct and the append isolated from the verdict: a failed audit is counted
-  and reported, and never changes what the policy decides.
+  (`>=0.1.5-rc.2 <0.2.0`), Harness version detection, and a pure compatibility classifier.
+- `src/state.ts` — the pure policy state machine and its reason-code vocabulary. `decide()` returns
+  the verdict, the reason and a decision event, with `mode` and `profile` deliberately absent from
+  its inputs.
+- `src/gate.ts` — the integration layer: `tools/pre-execute`, `tools/result`, `session/disposed`,
+  the `bmpp__classify` control tool, and the turn lifecycle that discards a previous turn's
+  classification and recall state when the Harness turn advances.
+- **Batch semantics** — a lookup and a mutation issued in the same parallel batch are detected, and
+  the write fails closed with `MEMORY_LOOKUP_PENDING_IN_BATCH` rather than being satisfied by a
+  search that had not landed yet.
+- `src/audit-sink.ts`, `src/audit-store.ts` — the audit record schema (domain `bmpp_audit`,
+  version 1, per-record layout) and its durable store, written through the Harness's public
+  `storageDomain` service. Metadata only: no tool arguments, no note content, no user text.
+- `bmpp__classify` — the model-facing control tool that declares a turn `simple` or `complex`.
+- Integration coverage for the **real Basic Memory contract**: the 21 tool identities of Basic
+  Memory 0.23.2 registered on the genuine `ToolRuntime` and served by local MCP-shaped fixtures. It
+  pins the bridge's naming rule, the read/write/destructive split, the recall signal (`isError`
+  only), the absence of `structuredContent` and `outputSchema`, and the `move_note` / `archive/`
+  behaviour.
+- `move_note` tracking: a state-changing memory operation is identified by **tool + origin +
+  destination**, where the destination records whether it came from `destination_path` or
+  `destination_folder`. Two moves of one note to two different places are two operations; the same
+  move twice is one.
+- A session-compatibility regression suite that drives the **real JSONL persistence backend**: it
+  persists a session carrying BMPP activity, reopens it through the real reader, and asserts that
+  the log carries no event type the Harness cannot interpret while the audit sidecar holds the
+  records.
+- `docs/ARCHITECTURE.md`, `docs/COMPATIBILITY.md`, `docs/DISTRIBUTION.md` — the design record, the
+  compatibility strategy, and the development versus distribution mechanisms.
 
-- Integration coverage for the **real Basic Memory contract**: the 21 tool
-  identities of Basic Memory 0.23.2 registered on the genuine `ToolRuntime` and
-  served by local MCP-shaped fixtures. It pins the bridge's naming rule, the
-  read/write/destructive split, the recall signal (`isError` only), the absence
-  of `structuredContent` and `outputSchema`, and the `move_note` /
-  `archive/` behaviour — including the write-tracking gap for moves, asserted as
-  an observed limitation rather than papered over.
+### Changed
 
-- `move_note` tracking: a state-changing memory operation is now identified by
-  **tool + origin + destination**, where the destination records whether it came
-  from `destination_path` or `destination_folder`. Two moves of one note to two
-  different places are two operations; the same move twice is one. The recall
-  gate, the reason codes, the classification of `move_note` and its
-  non-destructive status are unchanged.
-- `tools/emit-policy-stream.mts` and `tools/bmpp_verify.py` — an independent
-  regression layer over the durable `bmpp/policy` stream: the emitter drives the
-  real pipeline and writes the events, the verifier checks the record's
-  invariants in Python without sharing code with the implementation.
+- **The audit no longer uses the DSH session event log.** It previously persisted `bmpp/policy`
+  session events. A session event type the Harness does not know is required-on-read, and the
+  public `Session.append` API offers no way for a plugin to mark its own event type as safe to omit,
+  so every audited session became unobservable and unresumable. The audit now lives in a
+  plugin-owned storage sidecar; the session log stays interpretable by any Harness build.
+  Storage is an optional dependency: without it, BMPP enforces every rule and reports the records it
+  could not persist.
+- **Harness version detection now anchors on the host application entry point** instead of on BMPP's
+  own module. Resolving from BMPP's module read BMPP's *own* pinned Harness dependency and reported
+  the development dependency as the host version, which made the compatibility check meaningless in
+  a development overlay.
 
 ### Notes
 
-- **Gate mounted, audit durable, not yet installed anywhere.** The policy is enforced in-process and
-  every decision is written to the session log; no Cordis profile references BMPP yet, and the
-  Harness checkout is untouched.
+- **Gate mounted; audit durable; not published to a registry.** The policy is enforced in-process and
+  every decision is recorded in the audit sidecar. No Cordis profile references BMPP by default, and
+  the official Harness checkout is never modified.
 - **Recall outcome is `ok` or `failed` only.** The MCP bridge advertises no output schema for the
   search tool, so an empty-but-successful search is indistinguishable from a populated one and BMPP
-  refuses to parse content text to guess. `RECALL_EMPTY` stays modelled but unreachable; see
-  `docs/ARCHITECTURE.md` §7.4(a).
-- **`UNKNOWN_MEMORY_TOOL` is never emitted.** The code stays in the closed
-  vocabulary, but an unclassified tool inside the memory namespace fails closed
-  through the applicable precondition code, so the model receives the actionable
-  instruction. `tools/bmpp_verify.py` rule R11 enforces that.
-- **Secondary guards still pending.** The overwrite-without-read guard is enforced (except under
-  `profile: strict`, where behaviour is unchanged); the secret-pattern and test-fixture guards are
-  not implemented yet.
+  refuses to parse content text to guess. `RECALL_EMPTY` stays modelled but unreachable.
+- **`UNKNOWN_MEMORY_TOOL` is never emitted.** The code stays in the closed vocabulary, but an
+  unclassified tool inside the memory namespace fails closed through the applicable precondition
+  code, so the model receives the actionable instruction.
+- **Secondary guards are partial.** The overwrite-without-read guard is implemented. The
+  secret-pattern and test-fixture guards are modelled and configurable but not yet enforced.
+- **The standalone Python regression layer is stale.** `tools/emit-policy-stream.mts` and
+  `tools/bmpp_verify.py` were written against the earlier session-event audit and no longer observe
+  anything. The TypeScript suites are the authoritative verification.
+
+### Compatibility
+
+- Verified against DeepSeek Harness `0.1.5-rc.2` and `0.1.6-alpha.1`, both inside the declared
+  envelope `>=0.1.5-rc.2 <0.2.0`.
 
 [Unreleased]: https://github.com/rafa-elricardo/bmpp/commits/main

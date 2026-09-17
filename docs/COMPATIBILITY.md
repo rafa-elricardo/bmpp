@@ -8,7 +8,7 @@ by the explicit envelope declared in this document, `package.json` (`dsh.compati
 
 ```
 BMPP 0.1.0   ──compatible with──▶   DSH >= 0.1.5-rc.2 < 0.2.0
-                                     verified against: 0.1.5-rc.2
+                                     verified against: 0.1.5-rc.2, 0.1.6-alpha.1
 ```
 
 - The Harness is at `0.x`. Under semver, `0.x` minor bumps may break anything, so the envelope is
@@ -31,7 +31,8 @@ cannot drift from the code that enforces it.
 
 ## How the Harness version is detected
 
-The Harness exposes **no version service** on the Cordis context (verified against `0.1.5-rc.2`).
+The Harness exposes **no version service** on the Cordis context (verified against `0.1.5-rc.2`
+and `0.1.6-alpha.1`).
 BMPP therefore reads the version of an identity package it already resolves against —
 `@deepseek-ai/dsh-tools`, falling back to `@deepseek-ai/dsh-llm` — via `createRequire` and
 `package.json`. Every step is guarded:
@@ -130,8 +131,8 @@ Until that happens the new version is simply **not supported**: BMPP refuses to 
 than enforcing a policy it has not been checked against. Widening the envelope is a deliberate,
 tested change to `package.json` and `src/version.ts` together — never a side effect of a release.
 
-The `verified` list names only what has actually been exercised. It currently contains exactly one
-version: `0.1.5-rc.2`.
+The `verified` list names only what has actually been exercised. It currently contains
+`0.1.5-rc.2` and `0.1.6-alpha.1`.
 
 ## Re-verifying on a new Harness release
 
