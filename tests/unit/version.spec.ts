@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import {
   BMPP_VERSION,
@@ -160,6 +160,48 @@ describe('harness version detection', () => {
     return pathToFileURL(join(root, 'probe.js')).href
   }
 
+  /**
+   * Build a throwaway Harness installation: an app manifest at the root and an
+   * entry point one directory below it, mirroring `apps/cli/package.json` with
+   * `apps/cli/lib/bin.js`. That one-directory hop is the whole contract the
+   * application read depends on.
+   */
+  function appFixture(options: {
+    version?: string | undefined
+    name?: string
+    omitManifest?: boolean
+    manifestText?: string
+  } = {}): { entryUrl: string; root: string } {
+    const root = mkdtempSync(join(tmpdir(), 'bmpp-app-'))
+    const lib = join(root, 'lib')
+    mkdirSync(lib, { recursive: true })
+    const entry = join(lib, 'bin.js')
+    writeFileSync(entry, '// harness entry\n')
+    if (options.omitManifest !== true) {
+      writeFileSync(
+        join(root, 'package.json'),
+        options.manifestText
+          ?? JSON.stringify({ name: options.name ?? '@deepseek-ai/dsh', version: options.version ?? '0.0.0' }),
+      )
+    }
+    return { entryUrl: pathToFileURL(entry).href, root }
+  }
+
+  /** Install a shadowing identity package inside a fixture tree. */
+  function shadowIdentity(root: string, version: string, packageName = '@deepseek-ai/dsh-tools'): void {
+    const packageDir = join(root, 'node_modules', ...packageName.split('/'))
+    mkdirSync(packageDir, { recursive: true })
+    writeFileSync(
+      join(packageDir, 'package.json'),
+      JSON.stringify({
+        name: packageName,
+        version,
+        exports: { './package.json': './package.json', '.': './index.js' },
+      }),
+    )
+    writeFileSync(join(packageDir, 'index.js'), 'export const x = 1\n')
+  }
+
   it('reads the version of the identity package it resolves against', () => {
     expect(detectHarnessVersion(fixture('0.1.5-rc.2'))).toBe('0.1.5-rc.2')
   })
@@ -183,6 +225,58 @@ describe('harness version detection', () => {
     mkdirSync(packageDir, { recursive: true })
     writeFileSync(join(packageDir, 'package.json'), '{ not json')
     expect(detectHarnessVersion(pathToFileURL(join(root, 'probe.js')).href)).toBeUndefined()
+  })
+
+  it('reads the harness version from the running application manifest', () => {
+    expect(detectHarnessVersion(appFixture({ version: '0.1.5-rc.2' }).entryUrl)).toBe('0.1.5-rc.2')
+    expect(detectHarnessVersion(appFixture({ version: '0.1.6-alpha.1' }).entryUrl)).toBe('0.1.6-alpha.1')
+  })
+
+  it('accepts a plain entry path as well as an entry URL', () => {
+    const { entryUrl } = appFixture({ version: '0.1.6-alpha.1' })
+    expect(detectHarnessVersion(fileURLToPath(entryUrl))).toBe('0.1.6-alpha.1')
+  })
+
+  it('ignores a same-hop manifest that is not the harness application', () => {
+    // Some other launcher's package.json must never be reported as the Harness.
+    expect(detectHarnessVersion(appFixture({ version: '0.1.6-alpha.1', name: 'some-other-app' }).entryUrl))
+      .toBeUndefined()
+  })
+
+  it('tolerates an unreadable application manifest', () => {
+    expect(detectHarnessVersion(appFixture({ manifestText: '{ not json' }).entryUrl)).toBeUndefined()
+  })
+
+  it('reports unknown, without throwing, for an unusable entry point', () => {
+    for (const entry of ['', 'not-a-real-entry.js', pathToFileURL(tmpdir()).href]) {
+      expect(detectHarnessVersion(entry)).toBeUndefined()
+    }
+  })
+
+  it('falls back to the entry-point module tree when the harness has no app manifest', () => {
+    // The entry anchor resolves the tree, not this module: only a package that
+    // the ENTRY can reach is found.
+    const { entryUrl } = appFixture({ omitManifest: true })
+    expect(detectHarnessVersion(entryUrl)).toBeUndefined()
+
+    const { entryUrl: withIdentity, root } = appFixture({ omitManifest: true })
+    shadowIdentity(root, '0.1.5-rc.2')
+    expect(detectHarnessVersion(withIdentity)).toBe('0.1.5-rc.2')
+  })
+
+  it('never reports a plugin-local identity package as the harness version', () => {
+    // The regression that motivated the entry-point anchor: BMPP resolves this
+    // package from its own devDependencies, so a shadowing copy must lose to the
+    // application manifest.
+    const { entryUrl, root } = appFixture({ version: '0.1.6-alpha.1' })
+    shadowIdentity(root, '9.9.9')
+    expect(detectHarnessVersion(entryUrl)).toBe('0.1.6-alpha.1')
+  })
+
+  it('stays on the application manifest when only an identity package is shadowed', () => {
+    const { entryUrl, root } = appFixture({ version: '0.1.5-rc.2' })
+    shadowIdentity(root, '9.9.9', '@deepseek-ai/dsh-llm')
+    expect(detectHarnessVersion(entryUrl)).toBe('0.1.5-rc.2')
   })
 })
 

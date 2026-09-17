@@ -9,6 +9,8 @@
 
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { isAbsolute } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 /** BMPP's own package version (kept in step with `package.json`). */
 export const BMPP_VERSION = '0.1.0'
@@ -31,7 +33,22 @@ export const HARNESS_RANGE = {
 /** Harness versions this exact BMPP release has been verified against. */
 export const VERIFIED_HARNESS_VERSIONS: readonly string[] = ['0.1.5-rc.2']
 
-/** Packages whose installed version identifies the running Harness. */
+/**
+ * Package whose manifest names the Harness application.
+ *
+ * This is the canonical product identity: `apps/cli/src/bin.ts` reads this same
+ * manifest, by this same relative hop from its own module, to print `dsh --version`.
+ */
+const HARNESS_APP_PACKAGE = '@deepseek-ai/dsh'
+
+/**
+ * Packages the fallback reads when the application manifest is unreachable.
+ *
+ * They are Harness runtime packages, so an installed copy answers for the
+ * Harness that installed it. A plugin's own pinned copy of one of these — which
+ * is exactly what the primary read exists to avoid — is never consulted while a
+ * Harness application manifest is in reach.
+ */
 const HARNESS_IDENTITY_PACKAGES: readonly string[] = ['@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-llm']
 
 /** Outcome of comparing a Harness version against {@link HARNESS_RANGE}. */
@@ -107,20 +124,80 @@ export function compareVersions(left: ParsedVersion, right: ParsedVersion): numb
 }
 
 /**
+ * Resolve the module URL of the running Harness application entry point.
+ *
+ * The entry point is the only version anchor that belongs to the host rather
+ * than to the plugin: `process.argv[1]` is what the launcher actually executed,
+ * and the shipped CLI, the Python SDK runtime and the desktop host all pass a
+ * file inside the Harness installation.
+ *
+ * @param entry - diagnostic override as a `file:` URL or an absolute path;
+ *   `undefined` resolves the live process entry.
+ * @returns the entry URL, or `undefined` when no usable one exists.
+ */
+function harnessEntryUrl(entry?: string): string | undefined {
+  if (entry === undefined) {
+    const entryPath = process.argv[1]
+    return typeof entryPath === 'string' && isAbsolute(entryPath) ? pathToFileURL(entryPath).href : undefined
+  }
+  if (typeof entry !== 'string' || entry.length === 0) return undefined
+  if (entry.startsWith('file:')) return entry
+  return isAbsolute(entry) ? pathToFileURL(entry).href : undefined
+}
+
+/**
+ * Read the version from the Harness application manifest, one directory above
+ * the entry point.
+ *
+ * `@deepseek-ai/dsh` declares no `exports`, so it has no importable
+ * `package.json` subpath and must be read as a file. The manifest's own `name`
+ * is checked, so a launcher that is not the Harness can never contribute a
+ * version here.
+ *
+ * @param entryUrl - module URL of the Harness entry point.
+ * @returns the declared version, or `undefined` when this is not the Harness app.
+ */
+function versionFromAppManifest(entryUrl: string): string | undefined {
+  try {
+    const manifest: unknown = JSON.parse(readFileSync(new URL('../package.json', entryUrl), 'utf8'))
+    if (typeof manifest !== 'object' || manifest === null) return undefined
+    if ((manifest as { name?: unknown }).name !== HARNESS_APP_PACKAGE) return undefined
+    const version = (manifest as { version?: unknown }).version
+    return typeof version === 'string' && version.length > 0 ? version : undefined
+  } catch {
+    // A missing, unreadable or malformed manifest is "not detectable this way".
+    return undefined
+  }
+}
+
+/**
  * Best-effort detection of the RUNNING Harness version.
  *
  * The Harness exposes no version service on the Cordis context (verified
- * against 0.1.5-rc.2), so the version is read from the installed identity
- * package that the plugin already resolves against. Every step is guarded:
- * detection failure returns `undefined` and is never fatal.
+ * against 0.1.5-rc.2 and 0.1.6-alpha.1), so the version is read from the
+ * application that is hosting this plugin. Anchoring on the entry point matters:
+ * resolving from this module instead would read BMPP's OWN pinned copy of a
+ * Harness package and report the development dependency as the host version.
  *
- * @param resolveFrom - module specifier resolution base; defaults to this file.
+ * The application manifest is authoritative, and the identity packages are only
+ * a fallback for a launcher that runs the Harness without publishing its app
+ * manifest. Every step is guarded: detection failure returns `undefined` and is
+ * never fatal.
+ *
+ * @param entryUrl - Harness entry point as a `file:` URL or an absolute path;
+ *   defaults to the running process entry.
  * @returns the detected version, or `undefined` when undetectable.
  */
-export function detectHarnessVersion(resolveFrom: string = import.meta.url): string | undefined {
+export function detectHarnessVersion(entryUrl?: string): string | undefined {
+  const entry = harnessEntryUrl(entryUrl)
+  if (entry === undefined) return undefined
+
+  const declared = versionFromAppManifest(entry)
+  if (declared !== undefined) return declared
+
   let require: NodeJS.Require
   try {
-    require = createRequire(resolveFrom)
+    require = createRequire(entry)
   } catch {
     return undefined
   }
