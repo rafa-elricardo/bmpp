@@ -40,6 +40,14 @@ by an explicit envelope, never by version equality — see [docs/COMPATIBILITY.m
   distinct and the append isolated from the verdict: a failed audit is counted
   and reported, and never changes what the policy decides.
 
+- Integration coverage for the **real Basic Memory contract**: the 21 tool
+  identities of Basic Memory 0.23.2 registered on the genuine `ToolRuntime` and
+  served by local MCP-shaped fixtures. It pins the bridge's naming rule, the
+  read/write/destructive split, the recall signal (`isError` only), the absence
+  of `structuredContent` and `outputSchema`, and the `move_note` /
+  `archive/` behaviour — including the write-tracking gap for moves, asserted as
+  an observed limitation rather than papered over.
+
 ### Notes
 
 - **Gate mounted, audit durable, not yet installed anywhere.** The policy is enforced in-process and
