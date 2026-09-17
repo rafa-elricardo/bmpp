@@ -31,7 +31,7 @@ export const HARNESS_RANGE = {
 } as const
 
 /** Harness versions this exact BMPP release has been verified against. */
-export const VERIFIED_HARNESS_VERSIONS: readonly string[] = ['0.1.5-rc.2']
+export const VERIFIED_HARNESS_VERSIONS: readonly string[] = ['0.1.5-rc.2', '0.1.6-alpha.1']
 
 /**
  * Package whose manifest names the Harness application.

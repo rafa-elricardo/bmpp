@@ -38,7 +38,8 @@
     "compatibility": {
       "harness": ">=0.1.5-rc.2 <0.2.0",
       "verified": [
-        "0.1.5-rc.2"
+        "0.1.5-rc.2",
+        "0.1.6-alpha.1"
       ]
     }
   },
